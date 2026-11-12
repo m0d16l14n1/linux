@@ -95,18 +95,28 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 	 */
 	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
 			   asahi_stats_quality(snap.pstate_status));
+	/*
+	 * Not valid: say why, as pstate_status does. "unsupported" for every non-valid
+	 * state read as a missing feature on J815 while the firmware simply had sent no
+	 * record yet (stale: the GPU idles power-gated and reports nothing then).
+	 */
 	if (snap.pstate_status == 1)
 		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
 	else
-		n += sysfs_emit_at(buf, n, "pstate unsupported\n");
+		n += sysfs_emit_at(buf, n, "pstate %s\n",
+				   asahi_stats_quality(snap.pstate_status));
 	/* No A/B selector, measured power or temperature. */
 	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
 	/* M5 reports the state the GPU runs at: its frequency is the achieved one. */
 	if (snap.pstate_status == 1 && snap.achieved_frequency_hz)
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %llu\n",
 				   (unsigned long long)snap.achieved_frequency_hz);
-	else
+	else if (snap.pstate_status == 1)
+		/* A reported state with no frequency table for this board. */
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz unsupported\n");
+	else
+		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %s\n",
+				   asahi_stats_quality(snap.pstate_status));
 	if (snap.busy_status == 1)
 		n += sysfs_emit_at(buf, n, "busy_ns %llu\n",
 				   (unsigned long long)snap.busy_ns);
