@@ -37,7 +37,8 @@ pub(crate) struct Readout {
     /// state table ([`super::stats::Reader`]); zero where the table is unknown.
     pub(crate) achieved_frequency_hz: u64,
     pub(crate) busy_status: u32,
-    pub(crate) _pad: u32,
+    /// The GPU cores were power-gated at the last power observation (1) or not (0).
+    pub(crate) gated: u32,
 }
 
 const _: () = {
@@ -48,9 +49,6 @@ const _: () = {
 
 /// Interval of the M5 utilisation record (tag 0x13), in timer ticks: 8 ms at 24 MHz.
 const M5_UTIL_PERIOD_TICKS: u64 = 192_000;
-/// A utilisation record more than two intervals after the previous one follows a gap
-/// the firmware did not report (gated or lost records): it only sets the baseline.
-const M5_UTIL_MAX_WINDOW_TICKS: u64 = 2 * M5_UTIL_PERIOD_TICKS;
 /// Highest M5 performance state: the device tree's operating points 1 to 13 (0 is off).
 const M5_MAX_PSTATE: u32 = 13;
 const TIMER_HZ: u64 = 24_000_000;
@@ -79,6 +77,11 @@ pub(super) struct Telemetry {
     busy_ns: u64,
     /// End of the latest M5 performance state interval (tag 0x19), in timer ticks.
     pstate_interval_end: Option<u64>,
+    /// Diagnostic: the M5 performance state intervals (tag 0x19) summed per state, in
+    /// timer ticks, over every record not discarded (suspend, quarantine, invalidation).
+    /// Never reset. What an interval covers (powered time at the state, or only part of
+    /// it) is not confirmed yet, so this is not published as busy time.
+    pub(super) residency_ticks: [u64; M5_MAX_PSTATE as usize + 1],
 }
 
 impl Telemetry {
@@ -110,15 +113,49 @@ impl Telemetry {
         self.pstate_interval_end = None;
     }
 
-    /// The cores were observed power-gated. End the averaging epoch exactly as
-    /// any other boundary does, but keep the last published utilisation until
-    /// it ages out: it describes the work that ran just before the gate. After
-    /// that the GPU reads as idle (0%) for as long as it stays gated.
+    /// The cores were observed power-gated. End the averaging epoch, but keep the
+    /// last published utilisation until it ages out: it describes the work that ran
+    /// just before the gate. After that the GPU reads as idle (0%) for as long as it
+    /// stays gated. See [`Self::power_boundary`] (the driver calls that directly).
+    #[cfg(any(test, CONFIG_KUNIT))]
     pub(super) fn gate(&mut self) {
+        self.power_boundary(false);
+    }
+
+    /// A power boundary: the cores were gated (`powered` false) or came back in a new
+    /// power epoch. Either ends the utilisation averaging window, which runs on host
+    /// receive times. M5's last reported performance state stays current: the firmware
+    /// reports transitions and reports again after a power-up, and a J815 GPU under a
+    /// frame-paced load gates about 95 times a second, which made the state read stale
+    /// between nearly every two frames. Only [`Self::invalidate`] (suspend, recovery,
+    /// quarantine, teardown) ends it.
+    pub(super) fn power_boundary(&mut self, powered: bool) {
         let view = self.view;
         self.invalidate();
-        self.view.util_status = view.util_status;
-        self.gated = true;
+        if !powered {
+            self.view.util_status = view.util_status;
+            self.gated = true;
+        }
+        if self.m5 && view.pstate_status == VALID {
+            self.view.pstate_status = VALID;
+        }
+    }
+
+    /// A record the host-time window can't admit (queued before a power boundary, or
+    /// drained while the cores are gated) whose own firmware timestamps still place it:
+    /// M5's performance state reports and the busy time of its utilisation records. The
+    /// utilisation average never takes it.
+    pub(super) fn record_timed(&mut self, words: &[u32; 18], host_ns: u64) {
+        if !self.m5 {
+            return;
+        }
+        match words[0] {
+            0x13 if words[6] <= 100 => {
+                self.integrate_busy(u64::from(words[1]) | (u64::from(words[2]) << 32), words[6])
+            }
+            0x19 | 0x1b => self.record(words, host_ns, 0),
+            _ => {}
+        }
     }
 
     /// The firmware may publish several records per producer update: V25G83
@@ -200,7 +237,14 @@ impl Telemetry {
             // M5: the interval [words 3-4, words 1-2] that just ended, run at the state in
             // word 8. Its end timestamps the state report that follows it.
             0x19 if self.m5 => {
-                self.pstate_interval_end = Some(u64::from(words[1]) | (u64::from(words[2]) << 32));
+                let end = u64::from(words[1]) | (u64::from(words[2]) << 32);
+                let start = u64::from(words[3]) | (u64::from(words[4]) << 32);
+                if let Some(ticks) = self.residency_ticks.get_mut(words[8] as usize) {
+                    if end > start && end - start <= TIMER_HZ {
+                        *ticks = ticks.saturating_add(end - start);
+                    }
+                }
+                self.pstate_interval_end = Some(end);
             }
             // M5: the performance state now in effect, an index into the device tree's
             // operating points, in words 1 and 3. A report whose two words differ is not
@@ -220,20 +264,25 @@ impl Telemetry {
         }
     }
 
-    /// Credits the window an M5 utilisation record closes, at its device utilisation. The
-    /// window starts at the previous record of the epoch; a record after a longer gap than
-    /// [`M5_UTIL_MAX_WINDOW_TICKS`] (the GPU was gated or records were lost) or one whose
-    /// timestamp went back only sets the baseline, so an idle gap is never credited.
+    /// Credits the window an M5 utilisation record closes, at its device utilisation. A
+    /// record reports one nominal period ([`M5_UTIL_PERIOD_TICKS`]) and the firmware
+    /// emits it only while the cores run, so the window is the time since the previous
+    /// record, at most one period, and one period for the first record after a boundary
+    /// or a gate. An idle gap is never credited beyond that period. A timestamp going back
+    /// credits nothing. (Crediting only between two records of one power epoch, as
+    /// before, gave a J815 0 ns for a 20 s load: its GPU gates between frames.)
     fn integrate_busy(&mut self, timestamp: u64, device: u32) {
-        if let Some(last) = self.busy_ts {
-            let window = timestamp.wrapping_sub(last);
-            if timestamp > last && window <= M5_UTIL_MAX_WINDOW_TICKS {
-                // At most 384000 ticks x 100: no overflow.
-                let ns = window * u64::from(device) * 1_000_000_000 / (100 * TIMER_HZ);
-                self.busy_ns = self.busy_ns.saturating_add(ns);
-            }
+        let window = match self.busy_ts {
+            Some(last) if timestamp > last => (timestamp - last).min(M5_UTIL_PERIOD_TICKS),
+            Some(_) => 0,
+            None => M5_UTIL_PERIOD_TICKS,
+        };
+        // At most 192000 ticks x 100: no overflow.
+        let ns = window * u64::from(device) * 1_000_000_000 / (100 * TIMER_HZ);
+        self.busy_ns = self.busy_ns.saturating_add(ns);
+        if !matches!(self.busy_ts, Some(last) if timestamp <= last) {
+            self.busy_ts = Some(timestamp);
         }
-        self.busy_ts = Some(timestamp);
     }
 
     pub(super) fn read(&self, now_ns: u64, max_age_ns: u64) -> Readout {
@@ -261,6 +310,7 @@ impl Telemetry {
         } else {
             view.busy_status = UNSUPPORTED;
         }
+        view.gated = self.gated as u32;
         view
     }
 }
@@ -482,7 +532,7 @@ mod tests {
         busy_ns: 0,
         achieved_frequency_hz: 0,
         busy_status: UNSUPPORTED,
-        _pad: 0,
+        gated: 0,
     };
 
     fn ticks_ns(ticks: u64) -> u64 {
@@ -510,50 +560,78 @@ mod tests {
             stats.record(&words, 103, AGE);
             assert_eq!(stats.read(103, AGE).pstate_status, UNAVAILABLE);
         }
-        // Gating ends the epoch: the state is no longer current.
+        // A power gate keeps the state current (the firmware reports it again after a
+        // power-up); a real epoch end doesn't.
         stats.record(&M5_STATE, 104, AGE);
         stats.gate();
-        assert_eq!(stats.read(105, AGE).pstate_status, STALE);
+        let view = stats.read(105, AGE);
+        assert_eq!((view.pstate_status, view.pstate, view.gated), (VALID, 13, 1));
+        stats.power_boundary(true);
+        assert_eq!((stats.read(106, AGE).pstate_status, stats.read(106, AGE).gated), (VALID, 0));
+        stats.invalidate();
+        assert_eq!(stats.read(107, AGE).pstate_status, STALE);
+        // A report drained while gated still counts.
+        stats.record_timed(&M5_STATE, 108);
+        assert_eq!(stats.read(108, AGE).pstate_status, VALID);
+        // Intervals add up per state; a reversed or implausible one is not counted.
+        let before = stats.residency_ticks;
+        let mut interval = [0u32; 18];
+        interval[0] = 0x19;
+        (interval[1], interval[3], interval[8]) = (1523, 1000, 12);
+        stats.record_timed(&interval, 109);
+        (interval[1], interval[3]) = (1000, 1523);
+        stats.record_timed(&interval, 110);
+        (interval[1], interval[3], interval[8]) = (1523, 1000, 99);
+        stats.record_timed(&interval, 111);
+        assert_eq!(stats.residency_ticks[12], before[12] + 523);
+        assert_eq!(stats.residency_ticks.iter().sum::<u64>(), before.iter().sum::<u64>() + 523);
     }
 
     #[test]
     fn m5_busy_time_integrates_utilisation_windows() {
+        const PERIOD_NS: u64 = 8_000_000;
         let mut stats = Telemetry::m5();
         assert_eq!(
             (stats.read(0, AGE).busy_status, stats.read(0, AGE).busy_ns),
             (VALID, 0)
         );
-        // The first record only sets the baseline; the next two close one window each.
+        // Each record closes one period: the first after a boundary too. The 8 ticks of
+        // jitter between these records don't stretch a window past its period.
         for (n, words) in M5_U.iter().enumerate() {
             stats.record(words, 100 + n as u64, AGE);
         }
-        // Each window is rounded down to whole nanoseconds on its own.
-        let windows = ticks_ns(u64::from(M5_U[1][1] - M5_U[0][1]))
-            + ticks_ns(u64::from(M5_U[2][1] - M5_U[1][1]));
-        assert_eq!(stats.read(102, AGE).busy_ns, windows);
-        assert!((15_900_000..16_100_000).contains(&stats.read(102, AGE).busy_ns));
+        assert_eq!(stats.read(102, AGE).busy_ns, 3 * PERIOD_NS);
         // A window is credited at its device utilisation.
         let mut half = M5_U[2];
         half[1] += 192_000;
         half[6] = 50;
         stats.record(&half, 103, AGE);
-        assert_eq!(stats.read(103, AGE).busy_ns, windows + 4_000_000);
-        // A gate, a long gap or a timestamp going back only sets a new baseline.
-        let before = stats.read(103, AGE).busy_ns;
+        let mut busy = 3 * PERIOD_NS + PERIOD_NS / 2;
+        assert_eq!(stats.read(103, AGE).busy_ns, busy);
+        // After a gate the first record still closes its period.
         stats.gate();
         let mut after = half;
         after[1] += 192_000;
         stats.record(&after, 104, AGE);
-        assert_eq!(stats.read(104, AGE).busy_ns, before);
+        busy += PERIOD_NS / 2;
+        assert_eq!(stats.read(104, AGE).busy_ns, busy);
+        // A long gap credits one period, not the gap.
         after[1] += 3 * 192_000;
         stats.record(&after, 105, AGE);
-        assert_eq!(stats.read(105, AGE).busy_ns, before);
+        busy += PERIOD_NS / 2;
+        assert_eq!(stats.read(105, AGE).busy_ns, busy);
+        // A timestamp going back credits nothing.
         after[1] -= 1000;
         stats.record(&after, 106, AGE);
-        assert_eq!(stats.read(106, AGE).busy_ns, before);
+        assert_eq!(stats.read(106, AGE).busy_ns, busy);
+        // A record the window couldn't admit is still credited by its own time.
+        after[1] += 1000 + 192_000;
+        stats.record_timed(&after, 107);
+        busy += PERIOD_NS / 2;
+        assert_eq!(stats.read(107, AGE).busy_ns, busy);
         // An epoch boundary keeps the total.
         stats.invalidate();
-        assert_eq!(stats.read(107, AGE).busy_ns, before);
+        assert_eq!(stats.read(108, AGE).busy_ns, busy);
     }
 
     #[test]

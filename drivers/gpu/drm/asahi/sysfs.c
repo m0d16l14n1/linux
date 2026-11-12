@@ -122,6 +122,7 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 				   (unsigned long long)snap.busy_ns);
 	else
 		n += sysfs_emit_at(buf, n, "busy_ns unsupported\n");
+	n += sysfs_emit_at(buf, n, "gpu_power_gated %u\n", snap.gated ? 1 : 0);
 	n += sysfs_emit_at(buf, n, "power_mw unsupported\n"
 			   "temperature_raw unsupported\n");
 	n += sysfs_emit_at(buf, n, "utilisation_source firmware-statistics-tag-0x13\n"

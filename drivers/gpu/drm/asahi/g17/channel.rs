@@ -137,11 +137,7 @@ impl Rings {
         epoch: u64,
     ) {
         if !powered || !self.statistics_powered || epoch != self.statistics_epoch {
-            if powered {
-                self.telemetry.invalidate();
-            } else {
-                self.telemetry.gate();
-            }
+            self.telemetry.power_boundary(powered);
             // End the queued prefix *now*, not at the next drain. A boolean
             // discard-next-batch also throws away records produced after this
             // observation, even if the queue was empty at the boundary.
@@ -186,7 +182,12 @@ impl Rings {
         writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={} pstate={} delivery_intervals_ns={:?}",
             self.max_age_ns, view.util_status, view.util_host_ns, view.util_samples,
             view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks,
-            view.tiler, view.renderer, view.device, view.pstate, self.telemetry.delivery_intervals)
+            view.tiler, view.renderer, view.device, view.pstate,
+            self.telemetry.delivery_intervals)?;
+        // 24 MHz ticks to ns: x 125 / 3.
+        writeln!(f, "time busy_status={} busy_ns={} gated={} pstate_residency_ns={:?}",
+            view.busy_status, view.busy_ns, view.gated,
+            self.telemetry.residency_ticks.map(|ticks| ticks.saturating_mul(125) / 3))
     }
 
     pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
@@ -202,13 +203,16 @@ impl Rings {
             return;
         }
         let statistics = matches!(ring, ReportRing::Statistics);
-        let accept = !self.suspended
-            && self.statistics_powered
+        // Records a power boundary keeps out of the host-time window can still be placed by
+        // their own timestamps (Telemetry::record_timed); suspend, a real invalidation's
+        // discard and quarantine keep everything out.
+        let accept_timed = !self.suspended
             && !self.discard_statistics[role as usize]
             && !self
                 .quarantined
                 .iter()
                 .any(|rings| rings[ReportRing::Statistics as usize]);
+        let accept = accept_timed && self.statistics_powered;
         if let Err(error) = Self::consume_report(
             init,
             role,
@@ -217,6 +221,7 @@ impl Rings {
             &mut self.telemetry,
             self.max_age_ns,
             accept,
+            accept_timed,
             &mut self.statistics_cutoff[role as usize],
         ) {
             self.stop_report(dev, role, ring, error);
@@ -247,6 +252,7 @@ impl Rings {
         telemetry: &mut super::telemetry::Telemetry,
         max_age_ns: u64,
         accept_statistics: bool,
+        accept_timed: bool,
         statistics_cutoff: &mut Option<u32>,
     ) -> Result {
         let (state, entries, capacity, allowed_types) = ring.geometry(init);
@@ -286,6 +292,8 @@ impl Rings {
                 reports.record(role, words, host_ns, allowed_types, admitted);
                 if admitted {
                     telemetry.record(&words, host_ns, max_age_ns);
+                } else if accept_timed {
+                    telemetry.record_timed(&words, host_ns);
                 }
             }
             consumer = (consumer + 1) & (capacity - 1);
