@@ -358,7 +358,10 @@ struct apple_dart {
 
 	void __iomem *regs;
 	void __iomem *gapf;
-	/* The GAPF slice as it read at probe; a deep sleep resets it to 0 */
+	/*
+	 * The GAPF slice as the boot left it, read before the first write (U32_MAX until
+	 * then); a deep sleep resets it to 0
+	 */
 	u32 gapf_boot;
 	bool sleep_flushed;
 	/* The firmware 27 display sleep owns it: never replay locked trees. */
@@ -5423,7 +5426,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->gapf = devm_platform_ioremap_resource_byname(pdev, "gapf");
 		if (IS_ERR(dart->gapf))
 			return PTR_ERR(dart->gapf);
-		dart->gapf_boot = readl(dart->gapf);
+		/* Read at its first use, a sleep's: a boot without one never touches it. */
+		dart->gapf_boot = U32_MAX;
 	}
 	/* T8132's ISP DART names its DAPF page but has no ranges to restore. */
 	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf") &&
@@ -7365,6 +7369,17 @@ out:
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_state);
 #endif
 
+/* The slice as the boot left it is the first value read, before any write. */
+static u32 apple_dart_gapf_read(struct apple_dart *dart)
+{
+	u32 val = readl(dart->gapf);
+
+	if (dart->gapf_boot == U32_MAX)
+		dart->gapf_boot = val;
+
+	return val;
+}
+
 /*
  * Bit 4 of this DART's GAPF slice makes the fabric reject writes to its coprocessor's
  * CPU power state. It's clear from the flush until the streams come back on.
@@ -7376,7 +7391,7 @@ static int apple_dart_gapf_release(struct apple_dart *dart)
 	if (!dart->gapf)
 		return 0;
 
-	val = readl(dart->gapf);
+	val = apple_dart_gapf_read(dart);
 	writel(val & ~APPLE_DART_GAPF_PROTECT, dart->gapf);
 	if (readl(dart->gapf) & APPLE_DART_GAPF_PROTECT) {
 		dev_err(dart->dev, "GAPF slice stayed protected: %#x\n", val);
@@ -7392,7 +7407,7 @@ static void apple_dart_gapf_protect(struct apple_dart *dart)
 {
 	u32 val;
 
-	if (!dart->gapf || !dart->sleep_flushed)
+	if (!dart->gapf || !dart->sleep_flushed || dart->gapf_boot == U32_MAX)
 		return;
 
 	val = readl(dart->gapf);
@@ -7405,7 +7420,7 @@ int apple_dart_gapf_ready(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
-	if (!dart->gapf || !(readl(dart->gapf) & APPLE_DART_GAPF_PROTECT))
+	if (!dart->gapf || !(apple_dart_gapf_read(dart) & APPLE_DART_GAPF_PROTECT))
 		return 0;
 
 	return apple_dart_gapf_release(dart);
