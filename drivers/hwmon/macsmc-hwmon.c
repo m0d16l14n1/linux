@@ -1406,13 +1406,14 @@ static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 		tz = devm_thermal_of_zone_register(hwmon->dev, MACSMC_SOC_DIE_SENSOR_ID, hwmon,
 						   &macsmc_hwmon_die_ops);
 		if (!IS_ERR(tz)) {
-			dev_info(hwmon->dev, "SoC die temperature: device tree zone %s, hottest of%s (%u of %u listed keys present)\n",
+			dev_info(hwmon->dev, "SoC die zone %s (device tree): hottest of%s (%u of %u keys)\n",
 				 thermal_zone_device_type(tz), keys, hwmon->die_count,
 				 hwmon->die_listed);
 			return 0;
 		}
 		if (PTR_ERR(tz) != -ENODEV)
-			dev_warn(hwmon->dev, "cannot register the device tree SoC die zone (%pe)\n", tz);
+			dev_warn(hwmon->dev,
+				 "cannot register the device tree SoC die zone (%pe)\n", tz);
 	}
 
 	tz = thermal_tripless_zone_device_register(MACSMC_SOC_DIE_ZONE, hwmon,
