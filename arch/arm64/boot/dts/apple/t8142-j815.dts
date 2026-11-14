@@ -205,6 +205,8 @@
 #include "t8142-j813-j815.dtsi"
 #include "t8142-j813-usb.dtsi"
 #include "t8142-j813-dcpext.dtsi"
+/* DisplayPort audio of the two external displays (J813: identical ADT, not tested there yet). */
+#include "t8142-j813-dpaudio.dtsi"
 #include "t8142-j813-avd.dtsi"
 #include "t8142-j813-isp.dtsi"
 #include "t8142-j813-n1.dtsi"
