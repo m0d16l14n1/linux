@@ -99,6 +99,19 @@ struct ane_fw_platform {
 	u16 dart_revision;
 	u8 dapf_count;
 	const u8 *text_pin;
+	/*
+	 * Or the build's code: the TEXT digest with the text_env_size bytes at
+	 * text_env zeroed. The loader fills them in (the image has a fixed
+	 * pattern there), so unlike text_pin this is computed from the image.
+	 */
+	const u8 *text_code_pin;
+	u32 text_env, text_env_size;
+	/*
+	 * Another firmware build the loader may preload on this SoC, with its
+	 * own preload layout and pins; the handed-over layout selects it.
+	 */
+	const struct ane_fw_platform *next_build;
+	const char *build_name;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */
@@ -156,6 +169,8 @@ void ane_fw_platform_remove(struct platform_device *pdev);
 int ane_fw_platform_suspend(struct device *dev);
 int ane_fw_platform_resume(struct device *dev);
 int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
+const struct ane_fw_platform *ane_fw_platform_build(struct device_node *np,
+						    const struct ane_fw_platform *soc);
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc);
 void ane_h16_backend_remove(struct platform_device *pdev);
 int ane_h16_backend_suspend(struct device *dev);
