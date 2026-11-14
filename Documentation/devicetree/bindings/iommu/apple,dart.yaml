@@ -85,13 +85,15 @@ properties:
           Address filter (DAPF) registers, which restrict the physical
           addresses the DART lets its masters reach, or the slice of the
           fabric filter (GAPF) that protects the power state of the
-          coprocessor CPU behind this DART, cleared to power that CPU down
+          coprocessor CPU behind this DART, cleared to power that CPU down,
+          or the shared PS write-disable register that holds this DART's
+          bit for the same purpose (T8142)
 
   reg-names:
     minItems: 1
     items:
       - const: dart
-      - enum: [dapf, gapf, auxiliary]
+      - enum: [dapf, gapf, ps-wr-dis, auxiliary]
 
   interrupts:
     maxItems: 1
@@ -212,6 +214,14 @@ properties:
       power-down, and the ACIO, tunneled PCIe and external display DARTs for a
       deep sleep, in which their hosts save and restore them.
 
+  apple,ps-wr-dis-bit:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 31
+    description: >
+      This DART's bit in the ps-wr-dis register: set, the fabric rejects
+      writes to the power state of the coprocessor CPU behind it. Required
+      with a ps-wr-dis register; only that bit of the register is changed.
+
   apple,manual-availability:
     type: boolean
     description: >
@@ -266,6 +276,15 @@ properties:
       Unmask every error and enable the error interrupt for every stream,
       with the registers of the DART's revision, and leave the DART unlocked
       on error. For a T8110 DART that nothing initialises before Linux.
+
+  apple,tlb-busy-timeout-us:
+    description:
+      How long a TLB command of a T8110 DART may stay busy before it is
+      reported as timed out, in microseconds. A display scanout DART can hold
+      a ranged invalidation until its pipe is done with the frame it is
+      reading, longer than the default 2000.
+    minimum: 1
+    maximum: 100000
 
   apple,ctc-flush:
     type: boolean

@@ -238,6 +238,9 @@ pub(crate) struct Context {
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
+    /// This logical queue's use of the execution context its VM's queues share
+    /// (`super::exec_share`); `None` on M5.
+    share: Option<super::exec_share::Use>,
 }
 impl Context {
     #[expect(
@@ -253,6 +256,7 @@ impl Context {
         policy: Policy,
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
+        share: Option<super::exec_share::Use>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let hold = execution.hold(super::channel::control_fence)?;
@@ -335,7 +339,10 @@ impl Context {
             render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
-            states: WorkStates::new(),
+            states: match &share {
+                Some(share) => WorkStates::shared(share.claims().clone()),
+                None => WorkStates::new(),
+            },
             state_returns,
             compute_returns,
             order,
@@ -345,6 +352,7 @@ impl Context {
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
+            share,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
@@ -420,7 +428,14 @@ impl Context {
     /// Scheduler release and command retirement have both been witnessed.
     /// Keep installed storage alive while returning the finite TTBAT identity.
     pub(crate) fn release_execution(&self) {
-        self.execution.release();
+        match &self.share {
+            Some(share) => share.release_execution(),
+            None => self.execution.release(),
+        }
+    }
+    /// `other` runs in this context's shared execution context.
+    pub(crate) fn shares_execution(&self, other: &Context) -> bool {
+        self.share.is_some() && core::ptr::eq(&*self.execution, &*other.execution)
     }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
@@ -456,6 +471,33 @@ impl Context {
     pub(crate) fn firmware_may_link(&self) -> bool {
         let killed = super::queue::compute::exit::State::read(self).map_or(0, |state| state.killed);
         must_retain(self.work_head().ok(), self.work_head_va(), killed)
+    }
+
+    /// Rewrites the firmware-written context pages to their construction contents for a
+    /// cold-restarted firmware: the scheduler page (zero, then `Scheduler::init`) and the
+    /// empty work list head. Idempotent; only while no command of the context is in flight.
+    pub(crate) fn reset_after_cold_boot(&self) -> Result {
+        let scheduler = self.scheduler.pointer(0, UAT_PGSZ)?;
+        // SAFETY: The checked page stays mapped while the Arc lives; the GPU is idle and the
+        // cold firmware has not been handed any queue naming this page yet.
+        unsafe { scheduler.write_bytes(0, UAT_PGSZ) };
+        // SAFETY: The page-aligned page holds a whole Scheduler of plain integers, now zero,
+        // and no other reference to it exists while the device mutex is held.
+        unsafe { (*scheduler.cast::<fw::Scheduler>()).init() };
+        let mut work = self.work.lock();
+        work.render.reset_origins();
+        let head = self.work_head_va();
+        work.object.write(
+            UAT_PGSZ + 0x400,
+            fw::WorkHead {
+                next: 0,
+                previous: head,
+                unk10: 0,
+                unk14: 0,
+            },
+        )?;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn work_head_va(&self) -> u64 {

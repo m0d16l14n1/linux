@@ -30,6 +30,10 @@
  * T8132 takes the same path with its own tables and operations, t8132_sleep_ops,
  * measured the same way from a macOS sleep under aura's hypervisor. Its blocks are
  * T8140's at the same offsets from a SoC base 0x80000000 higher unless noted.
+ *
+ * A SoC whose sequences differ in more than its lists brings them as a part
+ * (sleep-internal.h), and shares the registry of coprocessors with the rest:
+ * today T6040, in sleep-t6040.c.
  */
 
 #include <linux/bitfield.h>
@@ -58,7 +62,11 @@
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
 #include <linux/platform_device.h>
+#include <linux/kthread.h>
+#include <linux/spmi.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/panic.h>
+#include <linux/seq_file.h>
 #include <linux/pm_domain.h>
 #include <linux/smp.h>
 #include <linux/soc/apple/dart.h>
@@ -78,34 +86,11 @@
 #include <asm/sysreg.h>
 #include <asm/virt.h>
 
-/* Must match aura's struct aura_s2r_mailbox. */
-#define AURA_S2R_MAGIC		0x3152325341525541ULL	/* "AURAS2R1" */
-
-struct aura_s2r_mailbox {
-	u64 magic;		/* aura, before the kernel starts */
-	u64 boot_mpidr;		/* aura: the only core that may take resume_pa */
-	u64 resume_pa;		/* kernel, armed before a commit; aura clears it */
-	u64 resumes;		/* aura: resume_pa taken this many times */
-};
-
-/* PS word */
-#define PS_AUTO_ENABLE		BIT(28)
-#define PS_UNLATCH		BIT(12)
-#define PS_DEV_DISABLE		BIT(10)
-#define PS_FLAGS		GENMASK(9, 8)
-#define PS_ACTUAL		GENMASK(7, 4)
-#define PS_TARGET		GENMASK(3, 0)
+#include "sleep-internal.h"
 
 /* Clock protection, per slice: its control word, and the bit that guards the slice's range. */
 #define PS_PROT_SLICE(n)	(0x100 + 0x40 * (n))
 #define PS_PROT_SLICE_ON	BIT(4)
-#define PS_OFF_TIMEOUT_US	5000
-#define PS_BUSY_SETTLE_US	1000
-
-/* CPU start block, as aura's smp_start_cpu() uses it. A core's bit is the SoC's. */
-#define CPU_START_STOP		0x0
-#define CPU_START_SYS		0x4
-#define CPU_START_CLUSTER(n)	(0x8 + (n) * 4)
 
 /* Power-gate page: reads back this value already. Purpose unknown. */
 #define PWRGATE_ON		0x80000000
@@ -121,40 +106,11 @@ struct aura_s2r_mailbox {
 #define CLUSTER_TIMEOUT_US	5000
 
 
-/* Watchdog block, ADT /arm-io/wdt reg[0]. WD2 is the sleep safety net. */
-#define WDT_WD0_COUNT		0x00
-#define WDT_WD0_CTL		0x0c
-#define WDT_WD1_COUNT		0x10
-#define WDT_WD2_COUNT		0x20
-#define WDT_WD2_ALARM		0x28
-#define WDT_WD2_CTL		0x2c
-#define WDT_TICKS_PER_S		24000000
-/* The sleep's own safety net: ADT /arm-io/wdt simple-reconfig-wdog-icc-time. */
-#define WDT_SLEEP_SECS		5
-/* Device suspend and resume can take a while, and nothing else recovers a hang in them. */
-#define WDT_SUSPEND_SECS	120
-
 #define AON_AP_DEADLINE		0x08
 
 /* Wake sources: a mask, so 0 enables. Status words are sticky. Where and how many: the SoC. */
 #define WAKE_WORDS		9
 #define WAKE_SOURCES_MAX	32
-
-/* The AP queue of the PMU's SPMI controller, and its response vector's enable and ack */
-#define SPMI_STATUS		0x00
-#define SPMI_STATUS_RX_EMPTY	BIT(24)
-#define SPMI_CMD		0x04
-#define SPMI_REPLY		0x08
-#define SPMI_NOTIFY_ENABLE	0x40
-#define SPMI_NOTIFY_REPLY	BIT(0)
-#define SPMI_NOTIFY_ACK		0x80
-#define SPMI_CMD_ACTIVE		BIT(15)
-#define SPMI_OP_EXT_WRITE(n)	((n) - 1)
-#define SPMI_OP_EXT_READ(n)	(0x20 | ((n) - 1))
-#define SPMI_OP_ZERO_WRITE	0x80
-#define SPMI_OP_SLEEP		0x11
-#define SPMI_OP_WAKEUP		0x13
-#define SPMI_POLL_US		20000
 
 /* A port controller on SPMI: registers go through a page select, then a data window. */
 #define HPM_REG_SELECT		0x00
@@ -176,9 +132,21 @@ struct aura_s2r_mailbox {
 #define HPM_CONTRACT_MS		1500
 #define HPM_RESET_TRIES		3
 
-/* A one-byte register write on the sleep's SPMI bus, to the PMU's USID */
-#define SPMI_CMD_WRITE		(BIT(15) | 0x30)
-#define SPMI_CMD_USID		GENMASK(11, 8)
+/*
+ * T8142's controllers are SPMI gen 4 (ADT "gen" = 4 on nub-spmi0, nub-spmi-a0 and the others).
+ * macOS 27.2.1's AppleSPMI Gen4 class, from its init: status +0x200 (RX empty bit 30), request
+ * FIFO +0x210, response FIFO +0x220, IRQ enable bank +0x400 and ack bank +0x600, word 8 (the
+ * notification word) at +0x420/+0x620 as gen 1's at 0x40/0x80. Gen 1's offsets land on other
+ * registers there: +0x4 is the FIFO flush, and +0x0 never reads RX empty.
+ */
+#define SPMI4_STATUS		0x200
+#define SPMI4_STATUS_RX_EMPTY	BIT(30)
+#define SPMI4_CMD		0x210
+#define SPMI4_REPLY		0x220
+#define SPMI4_NOTIFY_ENABLE	0x420
+#define SPMI4_NOTIFY_ACK	0x620
+/* A FIFO holds a few replies at most; never spin on a status that doesn't change. */
+#define SPMI_DRAIN_MAX		16
 
 /* T8132's power words where they aren't T8140's */
 #define T8132_PS_ATC0_COMMON		0x378
@@ -232,99 +200,20 @@ struct aura_s2r_mailbox {
 #define AMCC_WORD0_DSID_AGE_OUT	BIT(25)
 #define AMCC_WORD1_UNEXP_RT_HIT	BIT(8)
 
-/* A coprocessor's ASC */
-#define ASC_CPU_CONTROL		0x44
-#define ASC_CPU_CONTROL_RUN	BIT(4)
-#define ASC_CPU_STATUS		0x48
-
-/* The part of the PCIe block that ANS shares, whether or not its host is bound. */
-#define APCIE_AXI_EN0		0x104
-#define APCIE_AXI_EN1		0x108
-#define APCIE_CLK_CTRL		0x0
-#define APCIE_CLK_BUSY		BIT(31)
-#define APCIE_CLK_RUN		BIT(5)
-#define APCIE_CLK_OFF		BIT(1)
-#define APCIE_CLK_OFF2		BIT(2)
-#define APCIE_CLK_START		0x4
-#define APCIE_CLK_START_GO	BIT(31)
-#define APCIE_PHY_COMMON	0x4000
-#define APCIE_PHY_CTRL		0x8000
-#define APCIE_PHY_CTRL_CLK0REQ	BIT(0)
-#define APCIE_PHY_CTRL_CLK1REQ	BIT(1)
-#define APCIE_PHY_CTRL_CLK0ACK	BIT(2)
-#define APCIE_PHY_CTRL_CLK1ACK	BIT(3)
-#define APCIE_PHY_CTRL_RESET	BIT(4)
-#define APCIE_PHY_CTRL_UP	BIT(27)
-#define APCIE_PHY_RUN		0x8004
-#define APCIE_PHY_RUN_EN	BIT(0)
-#define APCIE_PHY_RUN_EN2	BIT(4)
-#define APCIE_PHY_READY		0x8008
-#define APCIE_PHY_IP_PLL_CTL	0x90
-#define APCIE_PHY_IP_PLL_HOLD	BIT(16)
-#define APCIE_PORT_INTSTAT	0x100
-#define APCIE_PORT_INTMSK	0x104
-#define APCIE_PORT_INT_LINK	GENMASK(7, 4)
-#define APCIE_PORT_L2		0x88
-#define APCIE_PORT_L2_ENTER	0x11
-#define APCIE_PORT_L2_BUSY	BIT(0)
-#define APCIE_PORT_PERST_GUARD	0x13c
-#define APCIE_PORT_LINKSTS	0x208
-#define APCIE_PORT_LINKSTS_UP	BIT(0)
-#define APCIE_PORT_APPCLK	0x800
-#define APCIE_PORT_APPCLK_EN	BIT(0)
-#define APCIE_PORT_APPCLK_CGDIS	BIT(8)
-#define APCIE_PORT_PERST	0x82c
-#define APCIE_PORT_PHY_LINK	BIT(31)
-#define APCIE_PORT_PHY_EN0	BIT(9)
-#define APCIE_PORT_PHY_EN1	BIT(10)
-#define APCIE_ENGINE_CTRL	0x0
-#define APCIE_ENGINE_IRQ_MASK	0x8
-#define APCIE_ENGINE_STOP	BIT(0)
-#define APCIE_FABRIC_STOP	0x4
-#define APCIE_PORT_STOP_US	5000
-#define APCIE_RC_ZERO		0x04
-#define APCIE_RC_READY_START	0x50
-#define APCIE_RC_READY_CFG	0x54
-#define APCIE_RC_READY_STAT	0x58
-#define APCIE_POLL_US		50000
-
-/* The coprocessors the last mile stops. Each driver idles its own first. */
-#define SLEEP_COPROCS		4
-
-static struct apple_sleep_coproc {
-	struct device *dev;
-	void __iomem *asc;
-	bool pcie_ans;
-	int (*last_check)(void *data);
-	int (*last_stop)(void *data);
-	void *data;
-	bool ready;
-	bool stopped;
-	u32 status;
-	int stop_ret;
-	/* No ASC: its last stop takes it whole, power word @ps included, before the others. */
-	bool first;
-	u32 ps;
-} apple_sleep_coprocs[SLEEP_COPROCS];
-static DEFINE_MUTEX(apple_sleep_coprocs_lock);
-
-/* Irreversible enclave stop; nonzero is legal only if SLEEP was not sent. */
-static struct {
-	struct device *dev;
-	int (*stop)(void *data);
-	void *data;
-} apple_sleep_enclave;
+/* The coprocessor and enclave registry is shared with the other SoCs' controllers. */
+#define SLEEP_COPROCS		APPLE_SLEEP_COPROCS
 
 /*
- * Written with bits 0 and 63 by every core right before its last WFI, measured
- * from macOS. This is not CYC_OVRD, which is undefined on this SoC.
+ * T8142 (APCIECoreRCGen4): the two PHY-IP words its _shutdownGen4Phy writes, and the PLL
+ * control word in pcieclkgen (/arm-io/apcie reg[6]), whose run, off and busy bits are the
+ * clock generator's above.
  */
-#define SYS_APL_DEEP_SLEEP	sys_reg(3, 5, 15, 6, 2)
-#define DEEP_SLEEP_ENABLE	(BIT_ULL(0) | BIT_ULL(63))
-
-#define SYS_APL_IPI_SR_EL1	sys_reg(3, 5, 15, 1, 1)
-#define IPI_SR_PENDING		BIT(0)
-#define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
+#define APCIE_GEN4_PHY_IP_38	0x38
+#define APCIE_GEN4_PHY_IP_38_EN	GENMASK(27, 26)
+#define APCIE_GEN4_PHY_IP_8C	0x8c
+#define APCIE_GEN4_PHY_IP_8C_OV	GENMASK(27, 24)
+#define APCIE_GEN4_CLK_HOLD	GENMASK(4, 3)
+#define APCIE_GEN4_CLK_EN	BIT(0)
 
 #define SLEEP_DISPLAYS_MAX	3
 
@@ -405,6 +294,9 @@ struct apple_sleep_domains {
 	u32 apcie_st;
 	u32 apcie_sys_st;
 	u32 apcie_phy_sw;
+	/* T8142: the shared block's AUS5 pair, the last its gate loop powers */
+	u32 apcie_aus5_aon;
+	u32 apcie_aus5;
 };
 
 struct apple_sleep;
@@ -527,6 +419,34 @@ struct apple_sleep_soc {
 	/* The PMC whose cluster vote for the encoders needs the complex up, and its bit */
 	const char *ave_pmc;
 	u32 ave_pmc_cluster;
+	/* What macOS reads once after its complex words; reported if still on. */
+	struct apple_sleep_words quiesce;
+	/* Blocks the SoC doesn't have, by reg-name, NULL-terminated: left unmapped. */
+	const char *const *regs_absent;
+	/* The sleep's SPMI bus has gen 4's queue layout (T8142). */
+	bool spmi_gen4;
+	/*
+	 * Derived from the binaries and another SoC's measurements, never through a full sleep and
+	 * wake: deep sleep is offered only with apple_sleep.deep=1 and is never the default, a
+	 * sleep stops before the commit unless apple_sleep.untested_commit=1, and each step is
+	 * noted in PMU scratch for after a reset.
+	 */
+	bool untested;
+	/*
+	 * ANS's PCIe block is T8142's (APCIECoreRCGen4): no clock generator or CIO3 PLL tables,
+	 * and its PHY's control words this far into "phy-block" (0: APCIE_PHY_CTRL).
+	 */
+	bool apcie_gen4;
+	u32 apcie_phy_ctrl;
+	/*
+	 * The radio's link is the loader's, under a generic ECAM host ("apple,radio-host"): it is
+	 * stopped at the commit and trained again after the wake by this driver.
+	 */
+	bool radio_retrain;
+	/* A core restarted after the commit takes the deep WFI in the holding pen. */
+	bool pen_deep;
+	/* The SoC's own sequences, in place of the lists above, or NULL */
+	const struct apple_sleep_part *part;
 };
 
 struct apple_sleep {
@@ -685,20 +605,37 @@ struct apple_sleep {
 	unsigned int ps_unlatched_count;
 	/* T8132: what macOS polls off after its complex words, still on at that point. */
 	u32 quiesce_still_on;
+	/* Restored from an image and this boot's mailbox not found: no deep sleep until a reboot */
+	bool mbox_lost;
+	/* The sleep bus's queue, by its SPMI generation */
+	u32 spmi_status;
+	u32 spmi_rx_empty;
+	u32 spmi_cmd;
+	u32 spmi_reply;
+	u32 spmi_notify_enable;
+	u32 spmi_notify_ack;
+	/* T8142: each complex's ACC word 0xe440f8 (optional), and what its steps returned */
+	void __iomem *acc_e;
+	void __iomem *acc_p;
+	int cluster_p_ret;
+	int perf_soc_ret;
+	int perf_dcs_ret;
+	unsigned int perf_dcs_from;
+	/* With radio_retrain: the radio's PCIe host, and its port's blocks and tables */
+	struct device_node *radio_host_np;
+	void __iomem *radio_port;
+	void __iomem *radio_lane;
+	void __iomem *radio_cfg;
+	struct apple_tunable *radio_port_tunable;
+	struct apple_tunable *radio_rc_tunable[3];
+	bool radio_trainable;
+	int radio_train_ret;
+	/* The radio's port stop at the commit (sleep_radio_port_stop()), and its first timeout */
+	int radio_stop_ret;
+	const char *radio_stop_step;
 };
 
 static struct apple_sleep *apple_sleep;
-
-static struct apple_sleep_coproc *apple_sleep_coproc_find(struct device *dev)
-{
-	int i;
-
-	for (i = 0; i < SLEEP_COPROCS; i++)
-		if (apple_sleep_coprocs[i].dev == dev)
-			return &apple_sleep_coprocs[i];
-
-	return NULL;
-}
 
 /* A registered coprocessor its driver has readied, whose run bit the last step clears. */
 static bool apple_sleep_coproc_ready_node(const struct device_node *np)
@@ -712,6 +649,33 @@ static bool apple_sleep_coproc_ready_node(const struct device_node *np)
 	return false;
 }
 
+/*
+ * Untested SoCs (apple_sleep_soc.untested): deep sleep offered at all, and the commit allowed.
+ * The second is for one sleep at a time: aurora-sleep-test sets it and clears it after.
+ */
+static bool sleep_deep;
+module_param_named(deep, sleep_deep, bool, 0444);
+MODULE_PARM_DESC(deep, "Untested SoC: offer deep sleep in mem_sleep (never the default)");
+static bool sleep_untested_commit;
+module_param_named(untested_commit, sleep_untested_commit, bool, 0644);
+MODULE_PARM_DESC(untested_commit,
+		 "Untested SoC: let a deep sleep through to the commit (else a dry run that refuses)");
+
+/*
+ * Untested SoCs: each step of a sleep in PMU scratch, readable after a reset. J815's ADT
+ * pmu-main info-scrpad is 0x8000 + 0x2800; aurora-silicon/linux#1664 (T6041) notes its steps
+ * at 0x8308 too. +0 magic, +1 the last step, +2/+4 the step's own detail, +3 the attempt's
+ * count this boot. The boot after reads and clears them.
+ */
+#define PMU_NOTE_BASE		0x8308
+#define PMU_NOTE_MAGIC		0xa5
+static bool sleep_pmu_notes = true;
+module_param_named(pmu_notes, sleep_pmu_notes, bool, 0644);
+MODULE_PARM_DESC(pmu_notes, "Untested SoC: note each sleep step in PMU scratch, for after a reset");
+
+static void sleep_note(struct apple_sleep *s, u8 step);
+static void sleep_note_at(struct apple_sleep *s, u8 off, u8 val);
+
 static bool sleep_usb_asleep;
 
 void apple_sleep_usb_set_asleep(bool asleep)
@@ -719,20 +683,6 @@ void apple_sleep_usb_set_asleep(bool asleep)
 	WRITE_ONCE(sleep_usb_asleep, asleep);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_set_asleep);
-
-static unsigned long sleep_usb_wake_ports;
-
-void apple_sleep_usb_set_wake_ports(unsigned long ports)
-{
-	WRITE_ONCE(sleep_usb_wake_ports, ports);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_usb_set_wake_ports);
-
-bool apple_sleep_usb_port_can_wake(unsigned int port)
-{
-	return port < BITS_PER_LONG && (READ_ONCE(sleep_usb_wake_ports) & BIT(port));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_usb_port_can_wake);
 
 /* The USB host's vote, kept until the word is mapped. Only bit 0 is touched, as on macOS. */
 static DEFINE_SPINLOCK(sleep_slp_ddr_lock);
@@ -897,200 +847,23 @@ void apple_sleep_restore_pins(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_restore_pins);
 
-/* Below EL2 a monitor owns the last mile, and this code doesn't run it. */
-int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
-				int (*last_stop)(void *data), void *data)
-{
-	struct apple_sleep_coproc *c;
-
-	if (!is_kernel_in_hyp_mode())
-		return -ENODEV;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_coproc_find(dev))
-		return -EEXIST;
-	c = apple_sleep_coproc_find(NULL);
-	if (!c)
-		return -ENOSPC;
-	c->asc = asc;
-	c->pcie_ans = pcie_ans;
-	c->last_check = NULL;
-	c->last_stop = last_stop;
-	c->data = data;
-	c->ready = false;
-	c->stopped = false;
-	c->first = false;
-	c->ps = 0;
-	c->dev = dev;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_register);
-
-int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
-				      void *data)
-{
-	struct apple_sleep_coproc *c;
-	struct device_node *np;
-	u32 ps = 0;
-	int ret;
-
-	if (!last_stop)
-		return -EINVAL;
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (np) {
-		of_property_read_u32(np, "reg", &ps);
-		of_node_put(np);
-	}
-	ret = apple_sleep_coproc_register(dev, NULL, false, last_stop, data);
-	if (ret)
-		return ret;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (c) {
-		c->first = true;
-		c->ps = ps;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_register_first);
-
-int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data))
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (!c)
-		return -ENOENT;
-	c->last_check = last_check;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_last_check);
-
-int apple_sleep_enclave_register(struct device *dev, int (*stop)(void *data), void *data)
-{
-	if (!is_kernel_in_hyp_mode())
-		return -ENODEV;
-
-	if (!stop)
-		return -EINVAL;
-	if (!apple_sleep_commit_stops_coprocs())
-		return -EOPNOTSUPP;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_enclave.dev)
-		return -EBUSY;
-	apple_sleep_enclave.stop = stop;
-	apple_sleep_enclave.data = data;
-	apple_sleep_enclave.dev = dev;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_enclave_register);
-
-void apple_sleep_enclave_unregister(struct device *dev)
-{
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_enclave.dev == dev)
-		memset(&apple_sleep_enclave, 0, sizeof(apple_sleep_enclave));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_enclave_unregister);
-
-void apple_sleep_coproc_unregister(struct device *dev)
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (c)
-		memset(c, 0, sizeof(*c));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_unregister);
-
-void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (!c)
-		return;
-	c->ready = ready;
-	c->stopped = false;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_ready);
-
-bool apple_sleep_coproc_stopped(struct device *dev)
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	return c && c->stopped;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
-
-bool apple_sleep_commit_stops_coprocs(void)
-{
-	return READ_ONCE(apple_sleep) && pm_suspend_via_firmware();
-}
-EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
-
 /*
- * The last thing that can fail on the way to the commit: no CPU but this one is up and
- * interrupts are off, so no lock can be held. A coprocessor stopped here comes back only
- * through a real sleep, so every refusal has to be behind this, and nothing after it may
- * go back. In the order measured on macOS, on ANS itself: whatever its driver does last,
- * status and control read, then 0 written twice.
+ * The dry run level of the suspend in progress, for a SoC's part that has dry runs: every
+ * sleep step that can be taken back runs, and the sleep is refused before the commit. 0
+ * otherwise.
  */
-static void apple_sleep_coproc_run_off(struct apple_sleep_coproc *c)
+static unsigned int apple_sleep_dry;
+
+void apple_sleep_set_dry(unsigned int level)
 {
-	/* Its own last stop cleared its run bits. */
-	if (!c->asc) {
-		c->stopped = true;
-		return;
-	}
-	c->status = readl(c->asc + ASC_CPU_STATUS);
-	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
-	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
-	c->stopped = true;
+	WRITE_ONCE(apple_sleep_dry, level);
 }
 
-/* A power word that a ready coprocessor's last stop lowers: on until the commit. */
-static bool apple_sleep_coproc_lowers(u32 ps)
+bool apple_sleep_power_loss(void)
 {
-	int i;
-
-	for (i = 0; i < SLEEP_COPROCS; i++)
-		if (apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].ready &&
-		    apple_sleep_coprocs[i].first && apple_sleep_coprocs[i].ps == ps)
-			return true;
-	return false;
+	return pm_suspend_via_firmware() && !READ_ONCE(apple_sleep_dry);
 }
-
-/* The last refusals, each coprocessor's own: nothing has stopped yet. */
-static int apple_sleep_coprocs_check(struct apple_sleep *s)
-{
-	int i, ret;
-
-	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
-
-		if (!c->dev || !c->ready || c->stopped || !c->last_check)
-			continue;
-		ret = c->last_check(c->data);
-		if (ret) {
-			dev_err(s->dev, "refused: %s: %d\n", dev_name(c->dev), ret);
-			return ret;
-		}
-	}
-
-	return 0;
-}
+EXPORT_SYMBOL_GPL(apple_sleep_power_loss);
 
 /*
  * The other cores stop at the commit, and one left awake there keeps the engine waiting
@@ -1105,46 +878,6 @@ static int apple_sleep_cpus_hold(struct apple_sleep *s)
 		dev_err(s->dev, "refused: a CPU didn't answer the hold: %d\n", ret);
 
 	return ret;
-}
-
-/* A nonzero result must mean no SLEEP was sent; post-send errors are fatal. */
-static int apple_sleep_enclave_stop(struct apple_sleep *s)
-{
-	int ret;
-
-	if (!apple_sleep_enclave.stop)
-		return 0;
-	ret = apple_sleep_enclave.stop(apple_sleep_enclave.data);
-	if (ret)
-		dev_err(s->dev, "refused before SEP SLEEP was sent: %d\n", ret);
-
-	return ret;
-}
-
-/*
- * In two passes, after the last refusal: from the first stop only a real sleep restarts the
- * GPU, so a failure here goes on to the commit. Those registered first stop whole first,
- * before macOS's off words drop under them: the GPU withdraws its PMP request there, and the
- * PMP has to see that before its own stop. The rest after the match.
- */
-static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
-{
-	int i;
-
-	if (first)
-		s->pcie_ans_stopped = false;
-	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
-
-		if (!c->dev || !c->ready || c->first != first)
-			continue;
-		s->pcie_ans_stopped |= c->pcie_ans;
-		if (c->stopped)
-			continue;
-		c->stop_ret = c->last_stop ? c->last_stop(c->data) : 0;
-		apple_sleep_coproc_run_off(c);
-	}
-	dsb(sy);
 }
 
 /* MPIDR's cluster is affinity 2, its core affinity 0, as 0.0.n and 1.1.n on T8140. */
@@ -1246,27 +979,14 @@ static void sleep_ps_lower(struct apple_sleep *s, u32 offset)
 	sleep_ps_lower_finish(s, offset, sleep_ps_lower_start(s, offset));
 }
 
-/*
- * As macOS raises a domain: the target, then AUTO_ENABLE once it reads on. Measured
- * byte for byte on ANS and PCIe, for instance 0x0f002300, 0x0f00200f, 0x1f00200f.
- */
 static int sleep_ps_raise_start(struct apple_sleep *s, u32 offset)
 {
-	void __iomem *reg = s->ps + offset;
-	u32 now;
-
-	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET, reg);
-
-	return readl_poll_timeout_atomic(reg, now, (now & PS_ACTUAL) == PS_ACTUAL, 1,
-					 PS_OFF_TIMEOUT_US);
+	return apple_sleep_ps_raise_start(s->ps + offset);
 }
 
 static void sleep_ps_raise_finish(struct apple_sleep *s, u32 offset)
 {
-	void __iomem *reg = s->ps + offset;
-
-	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET | PS_AUTO_ENABLE,
-	       reg);
+	apple_sleep_ps_raise_finish(s->ps + offset);
 }
 
 static int sleep_ps_raise(struct apple_sleep *s, u32 offset)
@@ -1305,6 +1025,22 @@ static bool sleep_ps_on(struct apple_sleep *s, u32 offset)
 static bool sleep_ps_full(struct apple_sleep *s, u32 offset)
 {
 	return FIELD_GET(PS_ACTUAL, readl(s->ps + offset)) == FIELD_MAX(PS_ACTUAL);
+}
+
+/*
+ * A coprocessor CPU's run bit, read only where it can answer: its domain at full power. Below
+ * that the hardware has idled the block (these words are hardware-managed, PS_AUTO_ENABLE) and
+ * a read of its registers can stall the bus; at .enter, with interrupts off on the last CPU,
+ * nothing then runs until WD2 resets the SoC. On J815 every sleep that reached .enter did
+ * exactly that (b28, boots 5343a2e5 to 03fd8d38; again after the port onto the per-SoC ops,
+ * boot 14343f67: last PMU note 0x10), while every pm_test step up to core came back. An idled
+ * CPU isn't running, so below full power this says no. Without a power word nothing says the
+ * block is powered: no read either.
+ */
+static bool sleep_asc_running(struct apple_sleep *s, u32 ps, void __iomem *asc)
+{
+	return ps && asc && sleep_ps_full(s, ps) &&
+	       (readl(asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN);
 }
 
 /* @pd's word in "ps": a power controller node, child of the PMGR that "ps" maps. */
@@ -1385,7 +1121,6 @@ EXPORT_SYMBOL_GPL(apple_sleep_domain_is_down);
  * target 4 and 0, released with the domain off, then raised again, its DARTs' state kept. The
  * caller has cleared the run bit, and starts the firmware after.
  */
-#define PS_BUSY			BIT(11)
 #define PS_RESET		BIT(31)
 #define PS_ENGINE_RESET_4	0x8f000244
 #define PS_ENGINE_RESET_0	0x80000000
@@ -1565,7 +1300,7 @@ static void apple_sleep_stray_restore(struct apple_sleep *s)
 	s->stray_lowered = 0;
 }
 
-static int apple_sleep_lower_stray(struct apple_sleep *s)
+static int apple_sleep_lower_stray(struct apple_sleep *s, bool dry)
 {
 	const struct apple_sleep_word *stray = s->soc->stray;
 	int i, ret = 0;
@@ -1580,6 +1315,16 @@ static int apple_sleep_lower_stray(struct apple_sleep *s)
 		if (apple_sleep_coproc_lowers(off)) {
 			dev_dbg(s->dev, "%s: left on for its driver's last stop\n",
 				stray[i].name);
+			continue;
+		}
+		/*
+		 * A dry run writes no power word. J815's first one with every check passing reset
+		 * the Mac by WD2 (boot 1e652ea3) right after the core step had passed, and this
+		 * lowering, of a domain whose block may still run, was the only write in it.
+		 */
+		if (dry) {
+			dev_info(s->dev, "%s is on at the last step: a real sleep lowers it here\n",
+				 stray[i].name);
 			continue;
 		}
 		sleep_ps_lower(s, off);
@@ -1664,8 +1409,7 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
 			dev_err(s->dev, "%s isn't bound\n", g->name);
 			bad++;
 			/* Nothing will stop it, and a commit over a running CPU resets the SoC. */
-			if (g->must_stop && g->asc && g->ps && sleep_ps_full(s, g->ps) &&
-			    (readl(g->asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN)) {
+			if (g->must_stop && sleep_asc_running(s, g->ps, g->asc)) {
 				dev_err(s->dev, "%s runs unbound: control %#x status %#x\n", g->name,
 					readl(g->asc + ASC_CPU_CONTROL),
 					readl(g->asc + ASC_CPU_STATUS));
@@ -1673,19 +1417,30 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
 			}
 			continue;
 		}
+		if (!g->must_stop)
+			continue;
 		/* A CPU whose domain is off isn't running, and its registers aren't there. */
 		if (g->ps && !sleep_ps_on(s, g->ps))
 			continue;
-		if (g->must_stop && (!g->asc ||
-				     ((readl(g->asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN) &&
-				      !apple_sleep_coproc_ready_node(g->np)))) {
+		/* Its driver quiesced it: as before, that answers for a run bit, now unread. */
+		if (g->asc && apple_sleep_coproc_ready_node(g->np))
+			continue;
+		/* Idled below full power, or stopped: its registers read only at full power. */
+		if (g->asc && g->ps && !sleep_asc_running(s, g->ps, g->asc))
+			continue;
+		if (g->asc && g->ps)
+			/* At full power (sleep_asc_running): its registers answer. */
 			dev_err(s->dev, "%s didn't stop: control %#x status %#x\n", g->name,
-				g->asc ? readl(g->asc + ASC_CPU_CONTROL) : 0,
-				g->asc ? readl(g->asc + ASC_CPU_STATUS) : 0);
-			bad++;
-			running++;
-		}
+				readl(g->asc + ASC_CPU_CONTROL), readl(g->asc + ASC_CPU_STATUS));
+		else
+			dev_err(s->dev, "%s didn't stop: %s\n", g->name,
+				g->asc ? "no power word says its registers can be read" :
+					 "no CPU registers mapped");
+		bad++;
+		running++;
 	}
+
+	sleep_note(s, 0x26);
 
 	for (i = 0; i < s->soc->ngate_off; i++) {
 		const struct apple_sleep_word *w = &s->soc->gate_off[i];
@@ -1739,20 +1494,9 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	bool refused = false, idled = false;
 	int i;
 
-	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
-
-		if (!c->dev)
-			continue;
-		if (c->ready) {
-			idled |= c->pcie_ans;
-		} else {
-			/* Nothing may lower a coprocessor's domain under its driver. */
-			dev_err(s->dev, "refused: %s is running and its driver has not quiesced it\n",
-				dev_name(c->dev));
-			refused = true;
-		}
-	}
+	sleep_note(s, 0x20);
+	if (apple_sleep_coprocs_refuse(s->dev, &idled))
+		refused = true;
 
 	if (num_online_cpus() != 1 ||
 	    (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) != s->mbox->boot_mpidr) {
@@ -1775,6 +1519,21 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 		refused = true;
 	}
 
+	sleep_note(s, 0x21);
+	/* Its first config access after the power loss would hang on the untrained link. */
+	if (s->radio_host_np && !s->radio_trainable) {
+		struct platform_device *host = of_find_device_by_node(s->radio_host_np);
+
+		if (host && READ_ONCE(host->dev.driver)) {
+			dev_err(s->dev, "refused: %s holds the radio's PCIe link, and its port can't be trained again after a real sleep\n",
+				dev_name(&host->dev));
+			refused = true;
+		}
+		if (host)
+			put_device(&host->dev);
+	}
+
+	sleep_note(s, 0x22);
 	/* ANS's link needs these after a real power loss. */
 	if (idled && !s->apcie_phy_tunable) {
 		dev_err(s->dev, "refused: no tunables to bring ANS's PCIe block back\n");
@@ -1787,24 +1546,27 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 		refused = true;
 	}
 
+	sleep_note(s, 0x23);
 	/* The engine waits for DISP_CPU with no timeout, so this must never slip. */
 	for (i = 0; i < s->soc->ndisp; i++) {
 		u32 ps = d->disp[i][0];
 
-		if (s->display[i].bound && sleep_ps_on(s, ps) &&
-		    (readl(s->display[i].asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN)) {
+		if (s->display[i].bound && sleep_asc_running(s, ps, s->display[i].asc)) {
 			dev_err(s->dev, "refused: a bound display coprocessor is still running\n");
 			refused = true;
 		}
 	}
 
+	sleep_note(s, 0x24);
 	if (apple_sleep_gate_failed(s))
 		refused = true;
 
 	if (refused)
 		return -EBUSY;
 
-	return apple_sleep_lower_stray(s);
+	sleep_note(s, 0x28);
+	/* A dry run, which stops right after this, writes no power word (as in b27). */
+	return apple_sleep_lower_stray(s, s->soc->untested && !READ_ONCE(sleep_untested_commit));
 }
 
 static void sleep_wake_arm(struct apple_sleep *s)
@@ -1870,14 +1632,14 @@ static int sleep_display_off(struct apple_sleep *s)
 			}
 		}
 
-		if (sleep_ps_on(s, domains[i][0]) && asc &&
-		    (readl(asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN)) {
+		if (sleep_asc_running(s, domains[i][0], asc)) {
 			writel(0, asc + ASC_CPU_CONTROL);
 			writel(0, asc + ASC_CPU_CONTROL);
 		}
 
 		/* Reads as a count of the DCPs powered, and macOS ends at 0. */
-		writel(n - 1 - j, s->pmc_dcp);
+		if (s->pmc_dcp)
+			writel(n - 1 - j, s->pmc_dcp);
 		if (soc->pwrgate_disp[i][0]) {
 			if (readl(s->ps + domains[i][0]) & PS_AUTO_ENABLE)
 				writel(readl(s->ps + domains[i][0]) &
@@ -2097,14 +1859,6 @@ bool apple_sleep_debug_link_cut(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut);
 
-bool apple_sleep_debug_link_up(void)
-{
-	struct apple_sleep *s = apple_sleep;
-
-	return s && !s->usb_down_ran && sleep_debug_link_up(s);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_debug_link_up);
-
 /*
  * macOS takes the wake for a lid closing during the sleep as a dark one: every driver wakes,
  * the display stays off, and the root domain sleeps again as soon as it sees the lid closed.
@@ -2119,36 +1873,6 @@ void apple_sleep_lid_closed_wake(void)
 	pm_set_dark_wake();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
-
-/* Read in the SMC's noirq resume. Forgotten as each sleep begins. */
-static int sleep_lid_closed = -ENODATA;
-
-void apple_sleep_lid_at_wake(bool closed)
-{
-	WRITE_ONCE(sleep_lid_closed, closed);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_lid_at_wake);
-
-int apple_sleep_lid_closed_at_wake(void)
-{
-	return READ_ONCE(sleep_lid_closed);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_at_wake);
-
-/* Set in the SMC's noirq resume. Forgotten as each sleep begins. */
-static int sleep_radio_woke = -ENODATA;
-
-void apple_sleep_radio_at_wake(bool woke)
-{
-	WRITE_ONCE(sleep_radio_woke, woke);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_radio_at_wake);
-
-int apple_sleep_radio_woke(void)
-{
-	return READ_ONCE(sleep_radio_woke);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_radio_woke);
 
 /*
  * The SMC woke the AP for the port alone, and this sleep cut the debug link: the cut's own
@@ -2260,6 +1984,118 @@ static void sleep_apcie_clk_off(struct apple_sleep *s)
 	writel(readl(clk) | APCIE_CLK_OFF2, clk);
 }
 
+/* The PHY's control words: at the start of "phy-block", or this far in (T8142). */
+static void __iomem *sleep_apcie_ctrl(struct apple_sleep *s)
+{
+	return s->apcie_phy + (s->soc->apcie_phy_ctrl ?: APCIE_PHY_CTRL);
+}
+
+/*
+ * APCIECoreRCGen4::_shutdownGen4Phy (AppleT8142PCIe, macOS 27.2.1): T8132's PHY stop with
+ * the UP bit set first, two PHY-IP words and its delays around it.
+ */
+static void sleep_apcie_gen4_phy_off(struct apple_sleep *s)
+{
+	void __iomem *ctrl = sleep_apcie_ctrl(s);
+	void __iomem *run = ctrl + (APCIE_PHY_RUN - APCIE_PHY_CTRL);
+	void __iomem *ip = s->apcie_phy_ip;
+	u32 val;
+
+	writel(readl(ctrl) | APCIE_PHY_CTRL_UP, ctrl);
+	udelay(10);
+	writel(readl(ip + APCIE_GEN4_PHY_IP_38) & ~APCIE_GEN4_PHY_IP_38_EN,
+	       ip + APCIE_GEN4_PHY_IP_38);
+	writel(readl(ip + APCIE_GEN4_PHY_IP_8C) | APCIE_GEN4_PHY_IP_8C_OV,
+	       ip + APCIE_GEN4_PHY_IP_8C);
+	udelay(5);
+	writel(readl(ctrl) | APCIE_PHY_CTRL_RESET, ctrl);
+	udelay(1);
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK1REQ, ctrl);
+	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK1ACK), 1, APCIE_POLL_US);
+	udelay(1);
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK0REQ, ctrl);
+	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US);
+	udelay(1);
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_UP, ctrl);
+	udelay(10);
+	writel(readl(run) & ~APCIE_PHY_RUN_EN2, run);
+	writel(readl(run) & ~APCIE_PHY_RUN_EN, run);
+}
+
+/*
+ * APCIECoreRCGen4::_shutdownPciePLLs: the only pcieclkgen writes in the kext. Nothing starts
+ * the PLLs again: they come back with the block's power.
+ */
+static void sleep_apcie_gen4_pll_off(struct apple_sleep *s)
+{
+	void __iomem *clk = s->apcie_clkgen + APCIE_CLK_CTRL;
+	u32 val;
+
+	writel((readl(clk) | APCIE_GEN4_CLK_HOLD) & ~APCIE_CLK_RUN, clk);
+	writel(readl(clk) | APCIE_CLK_OFF, clk);
+	writel(readl(clk) & ~APCIE_GEN4_CLK_EN, clk);
+	readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
+	writel(readl(clk) | APCIE_CLK_OFF2, clk);
+	writel((readl(clk) & ~APCIE_CLK_OFF) | APCIE_GEN4_CLK_EN, clk);
+}
+
+/*
+ * T8142's, from AppleT8142PCIe (APCIECoreRCGen4's power-down, then its gate loop), with all
+ * of the block's domains still on: the PHY stopped, the AUS5 domains off inside an UP-bit
+ * window (only once the PHY's first clock request is down), the PLLs off, the AXI enables
+ * cleared. Then the gate loop: gates 4 down to 0, SYS_ST, ST, SYS_GP, GP, ANS. PHY_SW is
+ * left on, as macOS leaves it. The radio's port is stopped first (sleep_radio_port_stop()),
+ * and its link is trained again after the wake (apple_sleep_radio_train()).
+ */
+static int sleep_radio_port_stop(struct apple_sleep *s);
+
+static void apple_sleep_lower_apcie_gen4(struct apple_sleep *s)
+{
+	const struct apple_sleep_domains *d = &s->soc->ps;
+	void __iomem *ctrl = sleep_apcie_ctrl(s);
+	bool on = sleep_ps_on(s, d->apcie_gp) && sleep_ps_on(s, d->apcie_sys_gp) &&
+		  sleep_ps_on(s, d->apcie_st) && sleep_ps_on(s, d->apcie_sys_st) &&
+		  sleep_ps_on(s, d->apcie_phy_sw);
+	bool clk0;
+
+	/* The radio's port first: its link runs on this block's PHY. */
+	if (s->radio_trainable && on) {
+		s->radio_stop_ret = sleep_radio_port_stop(s);
+	} else if (s->radio_trainable) {
+		s->radio_stop_step = "shared block already off";
+		s->radio_stop_ret = -ENOLINK;
+	}
+
+	if (on && s->apcie_phy && s->apcie_phy_ip && sleep_ps_on(s, d->apcie_aus5_aon) &&
+	    sleep_ps_on(s, d->apcie_aus5)) {
+		udelay(10);
+		sleep_apcie_gen4_phy_off(s);
+		clk0 = readl(ctrl) & APCIE_PHY_CTRL_CLK0REQ;
+		writel(readl(ctrl) | APCIE_PHY_CTRL_UP, ctrl);
+		udelay(10);
+		if (!clk0) {
+			sleep_ps_lower(s, d->apcie_aus5);
+			sleep_ps_lower(s, d->apcie_aus5_aon);
+		}
+		writel(readl(ctrl) & ~APCIE_PHY_CTRL_UP, ctrl);
+	} else {
+		sleep_ps_lower(s, d->apcie_aus5);
+		sleep_ps_lower(s, d->apcie_aus5_aon);
+	}
+	if (on && s->apcie_clkgen)
+		sleep_apcie_gen4_pll_off(s);
+	if (on && s->apcie_axi) {
+		writel(readl(s->apcie_axi + APCIE_AXI_EN0) & ~BIT(0), s->apcie_axi + APCIE_AXI_EN0);
+		writel(readl(s->apcie_axi + APCIE_AXI_EN1) & ~BIT(0), s->apcie_axi + APCIE_AXI_EN1);
+	}
+
+	sleep_ps_lower(s, d->apcie_sys_st);
+	sleep_ps_lower(s, d->apcie_st);
+	sleep_ps_lower(s, d->apcie_sys_gp);
+	sleep_ps_lower(s, d->apcie_gp);
+	sleep_ps_lower(s, d->ans);
+}
+
 /*
  * ANS's own link runs on this block, and macOS takes it down with the domains. Its
  * order, measured on one sleep, in the same microseconds as the power words. A block's
@@ -2270,6 +2106,10 @@ static void apple_sleep_lower_apcie(struct apple_sleep *s)
 	const struct apple_sleep_domains *d = &s->soc->ps;
 	u32 val;
 
+	if (s->soc->apcie_gen4) {
+		apple_sleep_lower_apcie_gen4(s);
+		return;
+	}
 	sleep_apcie_port_stop_once(s);
 	/* The PHY's registers need both domains on. */
 	if (s->apcie_phy && sleep_ps_on(s, d->apcie_phy_sw) && sleep_ps_on(s, d->apcie_sys_st))
@@ -2297,21 +2137,6 @@ static void apple_sleep_lower_apcie(struct apple_sleep *s)
 	sleep_ps_lower(s, d->ans);
 }
 
-/* Read-modify-write in table order, with no write where nothing changes. */
-static void sleep_tunable_apply_changed(void __iomem *regs, const struct apple_tunable *t)
-{
-	size_t i;
-
-	for (i = 0; i < t->sz; i++) {
-		void __iomem *reg = regs + t->values[i].offset;
-		u32 old = readl(reg);
-		u32 val = (old & ~t->values[i].mask) | (t->values[i].value & t->values[i].mask);
-
-		if (val != old)
-			writel(val, reg);
-	}
-}
-
 /*
  * The power loss takes the PHY's PLL and lane settings with it, and ANS's link can't
  * train without them. Applied as macOS does: the PLL table, then the lanes, then the
@@ -2321,9 +2146,297 @@ static void sleep_apcie_phy_ip_apply(struct apple_sleep *s)
 {
 	void __iomem *ctl = s->apcie_phy_ip + APCIE_PHY_IP_PLL_CTL;
 
-	sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_pll);
-	sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_lanes);
+	apple_sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_pll);
+	apple_sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_lanes);
 	writel(readl(ctl) & ~APCIE_PHY_IP_PLL_HOLD, ctl);
+}
+
+/*
+ * T8142's, as AppleT8142PCIe brings the block up and as aura does at boot, where it trains
+ * the radio's link after it (j813_n1.c): the domains with the AXI enables the lowering
+ * cleared, the PHY table and its reference PLL, the PHY's clocks out of reset, its run
+ * enables around the PLL and lane tables, the AXI tables, then the root complex. No clock
+ * generator or CIO3 PLL tables. Never run after a sleep.
+ */
+static int apple_sleep_raise_apcie_gen4(struct apple_sleep *s)
+{
+	const struct apple_sleep_domains *d = &s->soc->ps;
+	void __iomem *ctrl = sleep_apcie_ctrl(s);
+	void __iomem *run = ctrl + (APCIE_PHY_RUN - APCIE_PHY_CTRL);
+	void __iomem *ready = ctrl + (APCIE_PHY_READY - APCIE_PHY_CTRL);
+	void __iomem *common = s->apcie_phy + APCIE_PHY_COMMON;
+	u32 val;
+	int ret;
+
+	ret = sleep_ps_raise(s, d->ans);
+	ret |= sleep_ps_raise(s, d->apcie_gp);
+	ret |= sleep_ps_raise_start(s, d->apcie_sys_gp);
+	if (!ret) {
+		writel(readl(s->apcie_axi + APCIE_AXI_EN0) | BIT(0), s->apcie_axi + APCIE_AXI_EN0);
+		writel(readl(s->apcie_axi + APCIE_AXI_EN1) | BIT(0), s->apcie_axi + APCIE_AXI_EN1);
+	}
+	sleep_ps_raise_finish(s, d->apcie_sys_gp);
+	ret |= sleep_ps_raise(s, d->apcie_st);
+	ret |= sleep_ps_raise(s, d->apcie_sys_st);
+	ret |= sleep_ps_raise(s, d->apcie_phy_sw);
+	/* The gate loop powers all eight in the ADT's order: the AUS5 pair last. */
+	ret |= sleep_ps_raise(s, d->apcie_aus5_aon);
+	ret |= sleep_ps_raise(s, d->apcie_aus5);
+	if (ret)
+		return ret;
+
+	/* _apcieGPInit: the PHY table, then its reference PLL's clock-good. */
+	apple_tunable_apply(s->apcie_phy, s->apcie_phy_tunable);
+	ret = readl_poll_timeout_atomic(common, val, val & BIT(31), 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+
+	/* _initializeGen4Phy */
+	writel(readl(ctrl) | APCIE_PHY_CTRL_CLK0REQ, ctrl);
+	ret = readl_poll_timeout_atomic(ctrl, val, val & APCIE_PHY_CTRL_CLK0ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	udelay(1000);
+	writel(readl(ctrl) | APCIE_PHY_CTRL_CLK1REQ, ctrl);
+	ret = readl_poll_timeout_atomic(ctrl, val, val & APCIE_PHY_CTRL_CLK1ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_RESET, ctrl);
+	udelay(1000);
+	writel(readl(run) | APCIE_PHY_RUN_EN, run);
+	sleep_apcie_phy_ip_apply(s);
+	writel(readl(run) | APCIE_PHY_RUN_EN2, run);
+	ret = readl_poll_timeout_atomic(ready, val, val & BIT(0), 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(common) | BIT(0), common);
+	writel(readl(ctrl) | APCIE_PHY_CTRL_UP, ctrl);
+	apple_tunable_apply(s->apcie_axi, s->apcie_axi_tunable);
+
+	/* _enableRootComplex */
+	writel(0x140, s->apcie_rc + APCIE_RC_READY_CFG);
+	writel(readl(s->apcie_rc + APCIE_RC_READY_START) | BIT(0),
+	       s->apcie_rc + APCIE_RC_READY_START);
+
+	return readl_poll_timeout_atomic(s->apcie_rc + APCIE_RC_READY_STAT, val, val & BIT(0), 1,
+					 APCIE_POLL_US);
+}
+
+/* T8142's radio port, as aura trains it at boot (j813_n1.c: APCIECoreRCGen4Port) */
+#define RADIO_PORT_LTSSMCTL	0x80
+#define RADIO_PORT_PIPE_STS	0xa8
+#define RADIO_PORT_LINKSTS	0x208
+#define RADIO_PORT_LINKSTS_UP	BIT(0)
+#define RADIO_PORT_LINKSTS_BUSY	BIT(2)
+#define RADIO_PORT_APPCLK	0x800
+#define RADIO_PORT_STATUS	0x804
+#define RADIO_PORT_PERST	0x82c
+#define RADIO_LANE_REQ0		BIT(0)
+#define RADIO_LANE_REQ1		BIT(1)
+#define RADIO_LANE_ACK0		BIT(2)
+#define RADIO_LANE_ACK1		BIT(3)
+#define RADIO_LANE_HOLD		BIT(4)
+#define RADIO_LANE_EN0		BIT(9)
+#define RADIO_LANE_EN1		BIT(10)
+#define RADIO_CFG_BUSES		0x18
+#define RADIO_CFG_RO_WR		0x8bc
+#define RADIO_LINK_US		1000000
+#define PIN_MODE		GENMASK(3, 1)
+#define PIN_MODE_OUT		1
+
+/* APCIECoreRCGen4Port::_resetPortHardware */
+static const u32 radio_port_reset[][2] = {
+	{ 0x088, 0x110 },	{ 0x148, 0xffffffff },	{ 0x210, 0xffffffff },	{ 0x084, 0 },
+	{ 0x104, 0xfffffff0 },	{ 0x124, 0x100 },	{ 0x16c, 0 },		{ 0x13c, 0 },
+	{ 0x800, 0x100100 },	{ 0x808, 0x1001ff },	{ 0x82c, 0x10000 },	{ 0x130, 0x3020000 },
+	{ 0x140, 0x10 },	{ 0x144, 0x253770 },	{ 0x834, 0 },		{ 0x83c, 0 },
+};
+
+static void sleep_radio_perst(struct apple_sleep *s, bool asserted)
+{
+	void __iomem *reg = s->pins + PIN_REG(s->radio_perst);
+	bool high = asserted == !s->radio_perst_low;
+
+	writel((readl(reg) & ~(PIN_MODE | PIN_DATA)) | FIELD_PREP(PIN_MODE, PIN_MODE_OUT) |
+	       (high ? PIN_DATA : 0), reg);
+}
+
+/*
+ * After the power loss the radio's link is down, and the generic host's first config
+ * access to it would hang. Trained again as aura does it at boot, after the shared block
+ * (apple_sleep_raise_apcie_gen4()): the radio held in reset, the port's reset values and
+ * table, its application clock, the lane's reference clock buffer, PERST# released, the
+ * root port's tables with its read-only registers opened, then the LTSSM. The SMC's N1
+ * reset at boot isn't repeated: the SMC keeps its state across the sleep, as T8140's
+ * radio keeps its rail. macOS 27.2.1's AppleCentauriManager doesn't repeat it at a wake
+ * either: its function-reset (SMC gP13) runs at start, at shutdown, and to recover a
+ * crashed driver or a chip found in ROM, after two tries of function-warm_reset (SMC
+ * 'bpli'). Never run after a sleep.
+ */
+static int apple_sleep_radio_train(struct apple_sleep *s)
+{
+	void __iomem *port = s->radio_port, *lane = s->radio_lane, *cfg = s->radio_cfg;
+	unsigned int i;
+	u32 val;
+	int ret;
+
+	if (!sleep_ps_on(s, s->soc->ps.gpio))
+		return -ENODEV;
+	sleep_radio_perst(s, true);
+
+	for (i = 0; i < ARRAY_SIZE(radio_port_reset); i++)
+		writel(radio_port_reset[i][1], port + radio_port_reset[i][0]);
+	apple_tunable_apply(port, s->radio_port_tunable);
+	writel(readl(port + RADIO_PORT_APPCLK) | BIT(0), port + RADIO_PORT_APPCLK);
+
+	/* APCIECoreRCGen4Port::_initializeRefclkBuffer */
+	writel(readl(lane) | RADIO_LANE_REQ0, lane);
+	ret = readl_poll_timeout_atomic(lane, val, val & RADIO_LANE_ACK0, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(lane) | RADIO_LANE_REQ1, lane);
+	ret = readl_poll_timeout_atomic(lane, val, val & RADIO_LANE_ACK1, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(lane) & ~RADIO_LANE_HOLD, lane);
+	udelay(1000);
+	writel(readl(lane) | RADIO_LANE_EN0, lane);
+	writel(readl(lane) | RADIO_LANE_EN1, lane);
+	/* T(refclk-to-PERST#) */
+	udelay(1000);
+
+	writel(readl(port + RADIO_PORT_PERST) | BIT(0), port + RADIO_PORT_PERST);
+	sleep_radio_perst(s, false);
+	ret = readl_poll_timeout_atomic(port + RADIO_PORT_PIPE_STS, val, val & BIT(0), 1,
+					APCIE_POLL_US * 2);
+	if (!ret)
+		ret = readl_poll_timeout_atomic(port + RADIO_PORT_STATUS, val, val & BIT(0), 1,
+						APCIE_POLL_US * 5);
+	if (!ret)
+		ret = readl_poll_timeout_atomic(port + RADIO_PORT_LINKSTS, val,
+						!(val & RADIO_PORT_LINKSTS_BUSY), 1,
+						APCIE_POLL_US * 10);
+	if (ret)
+		return ret;
+
+	/* _initializeRootComplex: its tables need the read-only registers open. */
+	writel(readl(cfg + RADIO_CFG_RO_WR) | BIT(0), cfg + RADIO_CFG_RO_WR);
+	for (i = 0; i < ARRAY_SIZE(s->radio_rc_tunable); i++)
+		apple_tunable_apply(cfg, s->radio_rc_tunable[i]);
+	writel(readl(cfg + RADIO_CFG_RO_WR) & ~BIT(0), cfg + RADIO_CFG_RO_WR);
+	writel(1, port + RADIO_PORT_LTSSMCTL);
+	ret = readl_poll_timeout_atomic(port + RADIO_PORT_LINKSTS, val,
+					val & RADIO_PORT_LINKSTS_UP, 1, RADIO_LINK_US);
+	if (ret)
+		return ret;
+
+	/* The root port's buses as the loader set them; the PCI core restores the rest. */
+	writel(0x00010100, cfg + RADIO_CFG_BUSES);
+	/* PCIe's 100 ms from PERST# release to the first configuration request */
+	mdelay(100);
+
+	return 0;
+}
+
+/*
+ * The radio port's stop: APCIECoreRCGen4Port::disablePortHardware in macOS 27.2.1's
+ * AppleT8142PCIe, the same class (APCIECoreRCGen4Port.cpp) the M5 Pro's AppleT6050PCIe
+ * builds and pcie-apple.c's apple_pcie_t6050_port_disable() follows.
+ */
+#define RADIO_PORT_INTSTAT	0x100
+#define RADIO_PORT_PERST_GUARD	0x13c
+#define RADIO_PORT_LINKSTS_PHY_ALL0	BIT(12)
+#define RADIO_PORT_OUTS_TRANS	0x820
+#define RADIO_PORT_STATUS_RESET	BIT(2)
+#define RADIO_LANE_CGEN		BIT(31)
+#define RADIO_CFG_DEBUG0	0x728
+#define RADIO_CFG_LTSSM		GENMASK(5, 0)
+#define RADIO_CFG_LTSSM_L1_IDLE	0x14
+
+/* One of disablePortHardware's waits: macOS logs a timeout and goes on, and so does this. */
+static int sleep_radio_poll(struct apple_sleep *s, const char *step, void __iomem *reg,
+			    u32 mask, u32 want, unsigned int us)
+{
+	u32 val;
+	int ret = readl_poll_timeout_atomic(reg, val, (val & mask) == want, 1, us);
+
+	if (ret && !s->radio_stop_step)
+		s->radio_stop_step = step;
+	return ret;
+}
+
+/*
+ * The reverse of apple_sleep_radio_train(), just before the shared block's PHY stops and its
+ * power goes, in disablePortHardware's order (27.2.1 AppleT8142PCIe; its timeouts in
+ * brackets): PORT_STS's link reset flag (10 ms), the outstanding transactions drained
+ * (10 ms), the PERST# guard bit, the link out of L1 (errata #55), PHY_STATUS_ALL0 (5 ms),
+ * the lane's PIPE reset status (10 ms), the port's PERST# handshake with LANE_UCTRL_IDLE_ACK
+ * (2 ms), PERST# asserted in the port, the lane's reference clocks off, the interrupts
+ * cleared, the application clock off and the port's ready flag gone. Like macOS, a wait
+ * that times out is only noted, and the rest still runs. Then PERST# on the pin, as macOS
+ * holds the Neo's radio across a sleep (T8140, measured): in reset, its power and firmware
+ * kept, until the wake's train releases it. Before this the N1 saw its link vanish with
+ * PERST# released. Derived from the binary, never run.
+ */
+static int sleep_radio_port_stop(struct apple_sleep *s)
+{
+	void __iomem *port = s->radio_port, *lane = s->radio_lane, *cfg = s->radio_cfg;
+	void __iomem *perst = port + RADIO_PORT_PERST;
+	u32 val;
+	int ret = 0, err;
+
+	/* A port the loader never brought up has no link to stop. */
+	if (!(readl(port + RADIO_PORT_STATUS) & BIT(0))) {
+		s->radio_stop_step = "port not ready";
+		ret = -ENOLINK;
+		goto pin;
+	}
+
+	ret |= sleep_radio_poll(s, "PORT_STS link reset", port + RADIO_PORT_STATUS,
+				RADIO_PORT_STATUS_RESET, RADIO_PORT_STATUS_RESET, 10000);
+	err = readl_poll_timeout_atomic(port + RADIO_PORT_OUTS_TRANS, val,
+					!(val & GENMASK(8, 0)) || !(val & GENMASK(23, 16)),
+					1, 10000);
+	if (err && !s->radio_stop_step)
+		s->radio_stop_step = "OUTS_TRANS_STS";
+	ret |= err;
+	writel(readl(port + RADIO_PORT_PERST_GUARD) | BIT(8), port + RADIO_PORT_PERST_GUARD);
+
+	err = read_poll_timeout_atomic(readl, val,
+				       FIELD_GET(RADIO_CFG_LTSSM, val) != RADIO_CFG_LTSSM_L1_IDLE,
+				       5, 5000, false, cfg + RADIO_CFG_DEBUG0);
+	if (err && !s->radio_stop_step)
+		s->radio_stop_step = "LTSSM stuck in L1 idle";
+	ret |= err;
+	ret |= sleep_radio_poll(s, "PHY_STATUS_ALL0", port + RADIO_PORT_LINKSTS,
+				RADIO_PORT_LINKSTS_PHY_ALL0, RADIO_PORT_LINKSTS_PHY_ALL0, 5000);
+	ret |= sleep_radio_poll(s, "LANE_PIPE_RESET_STATUS", port + RADIO_PORT_PIPE_STS, BIT(0),
+				BIT(0), 10000);
+	writel(readl(perst) | BIT(24), perst);
+	ret |= sleep_radio_poll(s, "LANE_UCTRL_IDLE_ACK", port + RADIO_PORT_PIPE_STS, BIT(16),
+				BIT(16), 2000);
+	writel(readl(perst) | BIT(16), perst);
+	udelay(1);
+	writel(readl(perst) & ~BIT(0), perst);
+	udelay(1);
+	writel(readl(perst) & ~BIT(24), perst);
+	writel(readl(port + RADIO_PORT_PERST_GUARD) & ~BIT(8), port + RADIO_PORT_PERST_GUARD);
+
+	writel(readl(lane) & ~RADIO_LANE_CGEN, lane);
+	writel(readl(lane) & ~RADIO_LANE_EN1, lane);
+	writel(readl(lane) & ~RADIO_LANE_EN0, lane);
+	writel(readl(lane) | RADIO_LANE_HOLD, lane);
+	writel(readl(lane) & ~RADIO_LANE_REQ0, lane);
+	writel(readl(lane) & ~RADIO_LANE_REQ1, lane);
+
+	writel(~0, port + RADIO_PORT_INTSTAT);
+	writel(readl(port + RADIO_PORT_APPCLK) & ~BIT(0), port + RADIO_PORT_APPCLK);
+	ret |= sleep_radio_poll(s, "port stop", port + RADIO_PORT_STATUS, BIT(0), 0, 250000);
+	ret = ret ? -ETIMEDOUT : 0;
+pin:
+	if (sleep_ps_on(s, s->soc->ps.gpio))
+		sleep_radio_perst(s, true);
+	return ret;
 }
 
 /*
@@ -2338,6 +2451,9 @@ static int apple_sleep_raise_apcie(struct apple_sleep *s)
 	void __iomem *run = s->apcie_phy + APCIE_PHY_RUN;
 	u32 val;
 	int ret;
+
+	if (s->soc->apcie_gen4)
+		return apple_sleep_raise_apcie_gen4(s);
 
 	ret = sleep_ps_raise(s, d->ans);
 	ret |= sleep_ps_raise(s, d->apcie_gp);
@@ -2422,13 +2538,9 @@ static void apple_sleep_lower_io(struct apple_sleep *s)
 
 static void apple_sleep_set_wd2(struct apple_sleep *s, unsigned int secs)
 {
-	writel(0, s->wdt + WDT_WD2_CTL);
-	writel(0, s->wdt + WDT_WD2_COUNT);
-	writel(secs * WDT_TICKS_PER_S, s->wdt + WDT_WD2_ALARM);
-	writel(1, s->wdt + WDT_WD2_CTL);
+	apple_sleep_wd2_arm(s->wdt, secs);
 }
 
-#define PS_PARENT_MISSING	BIT(11)
 #define PS_AUTO_STATE		GENMASK(27, 24)
 #define PS_REWAKE_PASSES	2
 
@@ -2460,7 +2572,7 @@ static int sleep_ps_find(const u32 *all, int n, u32 offset)
  */
 static int sleep_ps_restore(void __iomem *reg, u32 saved)
 {
-	u32 keep = (saved & ~(PS_AUTO_ENABLE | PS_AUTO_STATE | PS_PARENT_MISSING | PS_DEV_DISABLE |
+	u32 keep = (saved & ~(PS_AUTO_ENABLE | PS_AUTO_STATE | PS_BUSY | PS_DEV_DISABLE |
 			      PS_FLAGS | PS_ACTUAL)) | (readl(reg) & PS_AUTO_STATE);
 	u32 now;
 	int ret;
@@ -2601,22 +2713,212 @@ static void sleep_ps_rewake_report(struct apple_sleep *s)
 
 #define T8132_PS_AON_ON_STATE	4
 
-/* As macOS writes the PMU: the reply's vector masked, then acknowledged, so none is left raised. */
 static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 {
 	u32 status, enable;
+	int i;
 
-	enable = readl(s->spmi + SPMI_NOTIFY_ENABLE);
-	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + SPMI_NOTIFY_ENABLE);
+	if (!s->soc->spmi_gen4) {
+		apple_sleep_pmu_write(s->spmi, s->soc->pmu_usid, reg, val);
+		return;
+	}
+
+	enable = readl(s->spmi + s->spmi_notify_enable);
+	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + s->spmi_notify_enable);
+	/*
+	 * Gen 4 (T8142): a reply someone else left (aura writes the PMU on this queue at a wake)
+	 * would be taken for ours, and ours left for the SPMI driver's next command. Drain before
+	 * and after, each bounded, as aurora-silicon/linux#1664 does on T6041.
+	 */
+	for (i = 0; s->soc->spmi_gen4 && i < SPMI_DRAIN_MAX &&
+	     !(readl(s->spmi + s->spmi_status) & s->spmi_rx_empty); i++)
+		readl(s->spmi + s->spmi_reply);
 	writel(((u32)reg << 16) | SPMI_CMD_WRITE |
-	       FIELD_PREP(SPMI_CMD_USID, s->soc->pmu_usid), s->spmi + SPMI_CMD);
-	writel(val, s->spmi + SPMI_CMD);
-	if (!readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, status,
-				       !(status & SPMI_STATUS_RX_EMPTY), 1, 1000))
-		readl(s->spmi + SPMI_REPLY);
-	writel(1, s->spmi + SPMI_NOTIFY_ACK);
-	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
+	       FIELD_PREP(SPMI_CMD_USID, s->soc->pmu_usid), s->spmi + s->spmi_cmd);
+	writel(val, s->spmi + s->spmi_cmd);
+	if (!readl_poll_timeout_atomic(s->spmi + s->spmi_status, status,
+				       !(status & s->spmi_rx_empty), 1, 1000))
+		readl(s->spmi + s->spmi_reply);
+	for (i = 0; s->soc->spmi_gen4 && i < SPMI_DRAIN_MAX &&
+	     !(readl(s->spmi + s->spmi_status) & s->spmi_rx_empty); i++)
+		readl(s->spmi + s->spmi_reply);
+	writel(1, s->spmi + s->spmi_notify_ack);
+	writel(enable, s->spmi + s->spmi_notify_enable);
 }
+
+static bool sleep_notes_on(struct apple_sleep *s)
+{
+	return s && s->spmi && s->soc->untested && READ_ONCE(sleep_pmu_notes);
+}
+
+/*
+ * Only where nothing else talks SPMI: from .prepare (every device suspended) to .wake (none
+ * resumed yet), on the one CPU left or before the others go.
+ */
+static void sleep_note_at(struct apple_sleep *s, u8 off, u8 val)
+{
+	if (sleep_notes_on(s))
+		sleep_pmu_write(s, PMU_NOTE_BASE + off, val);
+}
+
+static void sleep_note(struct apple_sleep *s, u8 step)
+{
+	sleep_note_at(s, 1, step);
+}
+
+void apple_sleep_note_sub(u8 step)
+{
+	sleep_note_at(apple_sleep, 4, step);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_note_sub);
+
+#ifdef CONFIG_HIBERNATION
+/*
+ * Hibernation restore breadcrumbs in the same PMU scratch bytes, magic 0xa6: [0] a6, [1] step
+ * (PM_HIB_NOTE_*), [2..3] device restore counter (LE), [4] device name hash. A hung restore ends
+ * in a watchdog or button reset that keeps no RAM on T8142; the PMU scratch survives it and the
+ * next boot's bootlog decodes it. Raw notes (no other SPMI user: IRQs off, devices quiesced) go
+ * through the sleep driver's own queue access; the others through the SPMI core, which
+ * serializes with every other user of the bus.
+ */
+#define PMU_HIB_NOTE_MAGIC	0xa6
+static atomic_t sleep_hib_reprobes = ATOMIC_INIT(0);
+static struct device_node *sleep_pmu_np;
+static struct spmi_device *sleep_pmu_sdev;
+
+/*
+ * Userspace progress after a resume from disk, written by aurora-hib-test with a shell builtin
+ * (no disk access): /sys/module/apple_sleep/parameters/hib_user_step. The heartbeat carries it.
+ */
+static unsigned int sleep_hib_user_step;
+static atomic_t sleep_hib_beats = ATOMIC_INIT(0);
+static void sleep_hib_note(u8 step, u16 seq, u8 tag, bool raw);
+
+/* Noted at once, so a userspace step lands even if the heartbeat never beats again. */
+static int sleep_hib_user_step_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_uint(val, kp);
+
+	if (!ret && pm_hibernate_is_restored())
+		sleep_hib_note(PM_HIB_NOTE_USER_STEP,
+			       (min_t(unsigned int, sleep_hib_user_step, 127) << 8) |
+			       min_t(int, atomic_read(&sleep_hib_beats), 255),
+			       pm_hibernate_health_get(), false);
+	return ret;
+}
+
+static const struct kernel_param_ops sleep_hib_user_step_ops = {
+	.set = sleep_hib_user_step_set,
+	.get = param_get_uint,
+};
+module_param_cb(hib_user_step, &sleep_hib_user_step_ops, &sleep_hib_user_step, 0644);
+MODULE_PARM_DESC(hib_user_step, "Userspace step after a resume from disk, for the PMU heartbeat");
+
+/* 100 beats 200 ms apart by busy-wait (no timer interrupt needed), then 1 s by sleep, 10 min in all. */
+#define SLEEP_HIB_FAST_BEATS	100
+#define SLEEP_HIB_BEATS		(SLEEP_HIB_FAST_BEATS + 580)
+static struct task_struct *sleep_hib_heartbeat;
+
+static void sleep_hib_note(u8 step, u16 seq, u8 tag, bool raw)
+{
+	struct apple_sleep *s = READ_ONCE(apple_sleep);
+	u8 b[5] = { PMU_HIB_NOTE_MAGIC, step, seq & 0xff, seq >> 8, tag };
+	struct spmi_device *sdev;
+	int i;
+
+	if (!s || !s->spmi || !s->soc->untested || !READ_ONCE(sleep_pmu_notes))
+		return;
+	/* A re-probe in flight keeps its note: if it never returns, the note names the device. */
+	if (step == PM_HIB_NOTE_REPROBE)
+		atomic_inc(&sleep_hib_reprobes);
+	else if (step == PM_HIB_NOTE_REPROBE_DONE)
+		atomic_dec(&sleep_hib_reprobes);
+	else if (step == PM_HIB_NOTE_ALIVE && atomic_read(&sleep_hib_reprobes) > 0)
+		return;
+	if (raw) {
+		for (i = 0; i < ARRAY_SIZE(b); i++)
+			sleep_pmu_write(s, PMU_NOTE_BASE + i, b[i]);
+		return;
+	}
+	sdev = READ_ONCE(sleep_pmu_sdev);
+	if (!sdev && sleep_pmu_np) {
+		sdev = spmi_find_device_by_of_node(sleep_pmu_np);
+		if (IS_ERR_OR_NULL(sdev))
+			return;
+		WRITE_ONCE(sleep_pmu_sdev, sdev);
+	}
+	if (sdev)
+		spmi_ext_register_writel(sdev, PMU_NOTE_BASE, b, ARRAY_SIZE(b));
+}
+
+/*
+ * After a resume from disk: every second for 10 minutes, PM_HIB_NOTE_ALIVE with the userspace
+ * step (high byte) and the seconds since the thaw / 2 (low byte), tagged with what the drivers
+ * reported (PM_HIB_HEALTH_*). A display left to the boot loader looks like a hang; this tells a
+ * live kernel from a dead one, and how far userspace got.
+ */
+static int sleep_hib_heartbeat_fn(void *unused)
+{
+	unsigned long start = jiffies;
+	bool stalled = false;
+	int i;
+
+	for (i = 0; i < SLEEP_HIB_BEATS && !kthread_should_stop(); i++) {
+		/* Bit 7 of the step byte: jiffies did not move over the busy-waited beats (no tick). */
+		if (i == SLEEP_HIB_FAST_BEATS / 2 && time_before(jiffies, start + HZ))
+			stalled = true;
+		atomic_set(&sleep_hib_beats, i);
+		sleep_hib_note(PM_HIB_NOTE_ALIVE,
+			       ((min_t(unsigned int, READ_ONCE(sleep_hib_user_step), 127) |
+				 (stalled ? 0x80 : 0)) << 8) | min(i, 255),
+			       pm_hibernate_health_get(), false);
+		if (i < SLEEP_HIB_FAST_BEATS)
+			mdelay(200);
+		else
+			msleep(1000);
+		cond_resched();
+	}
+	return 0;
+}
+
+static void sleep_hib_heartbeat_begin(void)
+{
+	struct task_struct *t;
+
+	if (READ_ONCE(pm_hibernate_note_hook) != sleep_hib_note || sleep_hib_heartbeat)
+		return;
+	atomic_set(&sleep_hib_reprobes, 0);
+	t = kthread_run(sleep_hib_heartbeat_fn, NULL, "hib-heartbeat");
+	if (!IS_ERR(t))
+		sleep_hib_heartbeat = t;
+}
+
+/* The PMU (an "apple,spmi-nvmem" child) on the controller whose queue the sleep driver writes. */
+static void sleep_hib_notes_init(struct platform_device *pdev)
+{
+	struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "spmi");
+	struct device_node *np;
+	struct resource r;
+
+	if (!res)
+		return;
+	for_each_compatible_node(np, NULL, "apple,spmi-nvmem") {
+		struct device_node *bus = of_get_parent(np);
+		bool match = bus && !of_address_to_resource(bus, 0, &r) &&
+			     res->start >= r.start && res->start <= r.end;
+
+		of_node_put(bus);
+		if (match) {
+			sleep_pmu_np = np;	/* reference kept */
+			WRITE_ONCE(pm_hibernate_note_hook, sleep_hib_note);
+			dev_info(&pdev->dev, "hibernation restore breadcrumbs in PMU scratch %#x (%pOF)\n",
+				 PMU_NOTE_BASE, np);
+			return;
+		}
+	}
+}
+#endif
+
 
 /*
  * The DRAM-kept wake writes each of these words and gives its switch 171 us to report closed.
@@ -2662,9 +2964,9 @@ static void apple_sleep_match(struct apple_sleep *s)
 	writel(0, s->wdt + WDT_WD1_COUNT);
 	sleep_pmu_write(s, soc->pmu_sleep_reg, soc->pmu_sleep_val);
 
-	s->spmi_saved[0] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+	s->spmi_saved[0] = readl(s->spmi + s->spmi_notify_enable);
 	s->spmi_saved[1] = readl(s->spmi_a0);
-	writel(soc->spmi_notify_sleep, s->spmi + SPMI_NOTIFY_ENABLE);
+	writel(soc->spmi_notify_sleep, s->spmi + s->spmi_notify_enable);
 	writel(soc->spmi_notify_sleep, s->spmi_a0);
 
 	for (i = 0; i < soc->ps_macos_on.count; i++) {
@@ -2768,7 +3070,7 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
 		else if (FIELD_GET(PS_ACTUAL, val) != 0xf)
 			writel(val & ~PS_FLAGS, s->ps + soc->ps_macos_on.offset[i]);
 	}
-	writel(s->spmi_saved[0], s->spmi + SPMI_NOTIFY_ENABLE);
+	writel(s->spmi_saved[0], s->spmi + s->spmi_notify_enable);
 	writel(s->spmi_saved[1], s->spmi_a0);
 }
 
@@ -2899,6 +3201,7 @@ static int apple_sleep_commit(unsigned long unused)
 	 * stay coherent until the commit.
 	 */
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
+	sleep_note(s, 0x60);
 	s->cpus_stop_ret = spin_table_stop_parked();
 
 	s->soc->ops->lower_io(s);
@@ -3163,8 +3466,8 @@ static void t8132_last_mile(struct apple_sleep *s)
 		writel(0, s->cluster + soc->cluster_cpu[i]);
 
 	s->quiesce_still_on = 0;
-	for (i = 0; i < ARRAY_SIZE(t8132_quiesce_words); i++)
-		if (sleep_ps_on(s, t8132_quiesce_words[i]))
+	for (i = 0; i < soc->quiesce.count; i++)
+		if (sleep_ps_on(s, soc->quiesce.offset[i]))
 			s->quiesce_still_on |= BIT(i);
 
 	/* All four read back unchanged on macOS. */
@@ -3337,35 +3640,61 @@ static int apple_sleep_enter(suspend_state_t state)
 	struct apple_sleep *s = apple_sleep;
 	int ret;
 
+	sleep_note(s, 0x10);
 	ret = apple_sleep_refuse(s);
-	if (ret)
+	if (ret) {
+		sleep_note(s, 0x2f);
 		return ret;
+	}
+	sleep_note(s, 0x29);
+	/*
+	 * An untested SoC stops here unless asked: every check has run, the stray words are
+	 * lowered (and come back below), and nothing that can't be undone has.
+	 */
+	if (s->soc->untested && !READ_ONCE(sleep_untested_commit)) {
+		sleep_note(s, 0x31);
+		apple_sleep_stray_restore(s);
+		dev_info(s->dev,
+			 "dry run: every check passed; refusing before the commit (untested SoC, apple_sleep.untested_commit=1 lets it through)\n");
+		return -EAGAIN;
+	}
+	sleep_note(s, 0x40);
 	ret = apple_sleep_cpus_hold(s);
 	/* As on macOS, the display goes off before the GPU. */
-	if (!ret)
+	if (!ret) {
+		sleep_note(s, 0x41);
 		ret = sleep_display_off(s);
-	if (!ret)
-		ret = apple_sleep_coprocs_check(s);
+	}
+	if (!ret) {
+		sleep_note(s, 0x42);
+		ret = apple_sleep_coprocs_check(s->dev);
+	}
 	/* Cover the platform's own preparation, after the PM core's early check. */
 	if (!ret && pm_wakeup_pending())
 		ret = -EBUSY;
-	if (!ret)
-		ret = apple_sleep_enclave_stop(s);
+	if (!ret) {
+		sleep_note(s, 0x43);
+		ret = apple_sleep_enclave_stop(s->dev);
+	}
 	if (ret) {
 		dev_dbg(s->dev, "refused before any commit coprocessor stop: %d\n", ret);
 		spin_table_unhold_parked();
 		apple_sleep_stray_restore(s);
 		return ret;
 	}
-	apple_sleep_coprocs_stop(s, true);
+	sleep_note(s, 0x44);
+	apple_sleep_coprocs_stop(true, &s->pcie_ans_stopped);
 
+	sleep_note(s, 0x45);
 	sleep_wake_arm(s);
+	sleep_note(s, 0x46);
 	apple_sleep_match(s);
+	sleep_note(s, 0x48);
 
 	/* Acknowledge a leftover done flag, as the DCS word has none on macOS. */
 	if (s->soc->ack_cluster_dcs && (readl(s->cluster_dcs) & CLUSTER_UP_DONE))
 		writel(readl(s->cluster_dcs), s->cluster_dcs);
-	apple_sleep_coprocs_stop(s, false);
+	apple_sleep_coprocs_stop(false, &s->pcie_ans_stopped);
 	/* Done by now unless no SMC driver is bound. */
 	apple_sleep_usb_down(s);
 	s->deep_once = READ_ONCE(sleep_deep_requested);
@@ -3374,10 +3703,12 @@ static int apple_sleep_enter(suspend_state_t state)
 
 	s->cntkctl = read_sysreg(cntkctl_el1);
 	pm_set_resume_via_firmware();
+	sleep_note(s, 0x4a);
 	ret = cpu_suspend(0, apple_sleep_commit);
 	if (ret)
 		panic("Apple committed sleep returned without physical wake: %d", ret);
 	apple_sleep_return(s);
+	sleep_note(s, 0x50);
 	if (s->deep_once)
 		sleep_slp_ddr_set_deep_once(false);
 
@@ -3393,12 +3724,16 @@ static int apple_sleep_begin(suspend_state_t state)
 {
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(sleep_debug_link_cut, false);
-	WRITE_ONCE(sleep_lid_closed, -ENODATA);
-	WRITE_ONCE(sleep_radio_woke, -ENODATA);
+	apple_sleep_wake_info_forget();
 	/* The PM core also calls .begin for s2idle when no s2idle ops are installed. */
 	if (state != PM_SUSPEND_MEM)
 		return 0;
 
+	if (apple_sleep && READ_ONCE(apple_sleep->mbox_lost)) {
+		dev_err(apple_sleep->dev,
+			"refused: restored from a hibernation image without this boot's s2r-mailbox\n");
+		return -EOPNOTSUPP;
+	}
 	if (apple_sleep) {
 		apple_sleep->apcie_port_stopped = false;
 		apple_sleep->usb_down_ran = false;
@@ -3620,7 +3955,13 @@ static int apple_sleep_ave_pd_init(struct apple_sleep *s)
 static int apple_sleep_prepare(void)
 {
 	struct apple_sleep *s = apple_sleep;
+	static u8 attempts;
 	int i;
+
+	sleep_note_at(s, 0, PMU_NOTE_MAGIC);
+	sleep_note_at(s, 2, 0);
+	sleep_note_at(s, 3, ++attempts);
+	sleep_note(s, 0x02);
 
 	/* With an encoder's domain linked, genpd has it off once the encoders are. */
 	if (s->soc->has_ave && !s->ave_pd_owned)
@@ -3675,6 +4016,8 @@ static void apple_sleep_report(void)
 	const struct apple_sleep_wake_name *names = s->soc->wake_names;
 	int i;
 
+	/* Back in Linux, before any device resumes: a reset after this is in the resume. */
+	sleep_note(s, 0x7e);
 	s->smc_woke_alone = false;
 	if (!s->returned)
 		return;
@@ -3705,12 +4048,25 @@ static void apple_sleep_report(void)
 			dev_err(s->dev, "%s stop reported %d; physical sleep completed\n",
 				dev_name(c->dev), c->stop_ret);
 	}
-	for (i = 0; i < ARRAY_SIZE(t8132_quiesce_words); i++)
+	for (i = 0; i < s->soc->quiesce.count; i++)
 		if (s->quiesce_still_on & BIT(i))
 			dev_err(s->dev, "power word %#x was on at the last step\n",
-				t8132_quiesce_words[i]);
+				s->soc->quiesce.offset[i]);
 	if (s->cpus_stop_ret)
 		dev_err(s->dev, "other CPUs did not stop: %d\n", s->cpus_stop_ret);
+	if (s->perf_soc_ret || s->perf_dcs_ret)
+		dev_warn(s->dev, "sleep perf states: SoC %d, DCS %d (DCS was %u)\n", s->perf_soc_ret,
+			 s->perf_dcs_ret, s->perf_dcs_from);
+	if (s->cluster_p_ret)
+		dev_err(s->dev, "P complex did not come back on: %d\n", s->cluster_p_ret);
+	if (s->radio_trainable && s->radio_stop_ret)
+		dev_warn(s->dev, "the radio's port stop at the commit: first timeout at %s: %d\n",
+			 s->radio_stop_step ?: "?", s->radio_stop_ret);
+	if (s->radio_trainable && s->radio_train_ret)
+		dev_err(s->dev, "the radio's PCIe link did not train after the wake: %d\n",
+			s->radio_train_ret);
+	else if (s->radio_trainable)
+		dev_info(s->dev, "the radio's PCIe link trained again after the wake\n");
 	if (s->cluster_e_ret || s->cluster_ave_ret || s->cluster_ave_commit_ret)
 		dev_err(s->dev, "cluster power timed out: E %d AVE %d, AVE at the commit %d\n",
 			s->cluster_e_ret, s->cluster_ave_ret, s->cluster_ave_commit_ret);
@@ -3723,8 +4079,15 @@ static void apple_sleep_report(void)
 			s->pcie_ans_on_ret);
 }
 
+static int apple_sleep_valid(suspend_state_t state)
+{
+	if (state != PM_SUSPEND_MEM)
+		return 0;
+	return !apple_sleep || !apple_sleep->soc->untested || READ_ONCE(sleep_deep);
+}
+
 static const struct platform_suspend_ops apple_sleep_ops = {
-	.valid = suspend_valid_only_mem,
+	.valid = apple_sleep_valid,
 	.begin = apple_sleep_begin,
 	.prepare = apple_sleep_prepare,
 	.enter = apple_sleep_enter,
@@ -3847,11 +4210,20 @@ static int apple_sleep_map_regs(struct apple_sleep *s)
 	for (i = 0; i < ARRAY_SIZE(apple_sleep_regs); i++) {
 		void __iomem **field = (void __iomem **)((u8 *)s + apple_sleep_regs[i].offset);
 
+		if (s->soc->regs_absent &&
+		    match_string(s->soc->regs_absent, -1, apple_sleep_regs[i].name) >= 0)
+			continue;
 		*field = apple_sleep_map(s->dev, apple_sleep_regs[i].name);
 		if (IS_ERR(*field))
 			return dev_err_probe(s->dev, PTR_ERR(*field), "no %s registers\n",
 					     apple_sleep_regs[i].name);
 	}
+
+	/* T8142: each complex's ACC word, used only with apple_sleep.acc_wake */
+	s->acc_e = apple_sleep_map(s->dev, "acc-e");
+	s->acc_p = apple_sleep_map(s->dev, "acc-p");
+	if (IS_ERR(s->acc_e) || IS_ERR(s->acc_p))
+		s->acc_e = s->acc_p = NULL;
 
 	ret = apple_sleep_map_numbered(s, "mcc", s->mcc, s->soc->nmcc);
 	if (ret)
@@ -3904,9 +4276,8 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
 	return 0;
 }
 
-static struct apple_tunable *apple_sleep_apcie_tunable(struct apple_sleep *s,
-						       struct device_node *np,
-						       const char *name, const char *prop)
+struct apple_tunable *apple_sleep_apcie_tunable(struct device *dev, struct device_node *np,
+						const char *name, const char *prop)
 {
 	int idx = of_property_match_string(np, "reg-names", name);
 	struct apple_tunable *t;
@@ -3914,21 +4285,21 @@ static struct apple_tunable *apple_sleep_apcie_tunable(struct apple_sleep *s,
 
 	if (idx < 0 || of_address_to_resource(np, idx, &res))
 		return NULL;
-	t = devm_apple_tunable_parse(s->dev, np, prop, &res);
+	t = devm_apple_tunable_parse(dev, np, prop, &res);
 
 	return IS_ERR(t) ? NULL : t;
 }
 
-static void __iomem *apple_sleep_apcie_block(struct apple_sleep *s, struct device_node *np,
-					     const char *name, const char *prop,
-					     struct apple_tunable **tunable)
+void __iomem *apple_sleep_apcie_block(struct device *dev, struct device_node *np,
+				      const char *name, const char *prop,
+				      struct apple_tunable **tunable)
 {
 	int idx = of_property_match_string(np, "reg-names", name);
 
 	if (idx < 0)
 		return NULL;
 	if (prop) {
-		*tunable = apple_sleep_apcie_tunable(s, np, name, prop);
+		*tunable = apple_sleep_apcie_tunable(dev, np, name, prop);
 		if (!*tunable)
 			return NULL;
 	}
@@ -3947,21 +4318,31 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 
 	if (!np)
 		return;
-	s->apcie_axi = apple_sleep_apcie_block(s, np, "axi2af", "apple,tunable-axi2af",
+	s->apcie_axi = apple_sleep_apcie_block(s->dev, np, "axi2af", "apple,tunable-axi2af",
 					       &s->apcie_axi_tunable);
-	s->apcie_cio3pll = apple_sleep_apcie_block(s, np, "cio3pll", "apple,tunable-cio3pll",
+	s->apcie_cio3pll = apple_sleep_apcie_block(s->dev, np, "cio3pll", "apple,tunable-cio3pll",
 						   &s->apcie_cio3pll_tunable);
-	s->apcie_clkgen = apple_sleep_apcie_block(s, np, "clkgen", "apple,tunable-clkgen",
+	s->apcie_clkgen = apple_sleep_apcie_block(s->dev, np, "clkgen", "apple,tunable-clkgen",
 						  &s->apcie_clkgen_tunable);
-	s->apcie_phy = apple_sleep_apcie_block(s, np, "phy-block", "apple,tunable-phy",
+	s->apcie_phy = apple_sleep_apcie_block(s->dev, np, "phy-block", "apple,tunable-phy",
 					       &s->apcie_phy_tunable);
-	s->apcie_rc = apple_sleep_apcie_block(s, np, "rc", NULL, NULL);
-	s->apcie_phy_ip = apple_sleep_apcie_block(s, np, "phy-ip", "apple,tunable-phy-ip-pll",
+	s->apcie_rc = apple_sleep_apcie_block(s->dev, np, "rc", NULL, NULL);
+	s->apcie_phy_ip = apple_sleep_apcie_block(s->dev, np, "phy-ip", "apple,tunable-phy-ip-pll",
 						  &s->apcie_phy_ip_pll);
-	s->apcie_phy_ip_lanes = apple_sleep_apcie_tunable(s, np, "phy-ip",
+	s->apcie_phy_ip_lanes = apple_sleep_apcie_tunable(s->dev, np, "phy-ip",
 							  "apple,tunable-phy-ip-auspma");
-	if (!s->apcie_axi || !s->apcie_cio3pll || !s->apcie_clkgen || !s->apcie_phy ||
-	    !s->apcie_rc || !s->apcie_phy_ip || !s->apcie_phy_ip_lanes) {
+	/*
+	 * T8142's block has neither table: those steps are skipped. Its clock generator
+	 * (pcieclkgen) is only written at the power-down, with no table.
+	 */
+	if (s->soc->apcie_gen4) {
+		s->apcie_cio3pll = NULL;
+		s->apcie_cio3pll_tunable = s->apcie_clkgen_tunable = NULL;
+		s->apcie_clkgen = apple_sleep_apcie_block(s->dev, np, "clkgen", NULL, NULL);
+	}
+	if (!s->apcie_axi || !s->apcie_phy || !s->apcie_rc || !s->apcie_phy_ip ||
+	    !s->apcie_phy_ip_lanes ||
+	    (!s->soc->apcie_gen4 && (!s->apcie_cio3pll || !s->apcie_clkgen))) {
 		dev_info(s->dev,
 			 "no PCIe tunables for ANS: suspend-to-RAM with it stopped will be refused\n");
 		s->apcie_phy_tunable = NULL;
@@ -3970,12 +4351,12 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 		s->apcie_axi = NULL;
 	}
 
-	s->apcie_port = apple_sleep_apcie_block(s, np, "port0", NULL, NULL);
-	s->apcie_port_phy = apple_sleep_apcie_block(s, np, "phy0", NULL, NULL);
+	s->apcie_port = apple_sleep_apcie_block(s->dev, np, "port0", NULL, NULL);
+	s->apcie_port_phy = apple_sleep_apcie_block(s->dev, np, "phy0", NULL, NULL);
 	engine = of_parse_phandle(np, "apple,piodma", 0);
 	if (engine) {
-		s->apcie_engine = apple_sleep_apcie_block(s, engine, "engine", NULL, NULL);
-		s->apcie_fabric = apple_sleep_apcie_block(s, engine, "fabric", NULL, NULL);
+		s->apcie_engine = apple_sleep_apcie_block(s->dev, engine, "engine", NULL, NULL);
+		s->apcie_fabric = apple_sleep_apcie_block(s->dev, engine, "fabric", NULL, NULL);
 		of_node_put(engine);
 	}
 	of_node_put(np);
@@ -4037,6 +4418,53 @@ out:
 	of_node_put(np);
 }
 
+/*
+ * T8142's radio port: its blocks with the shared block's ("apple,apcie": radio-port,
+ * radio-lane and radio-cfg, the root port's configuration space), the loader's tables for
+ * them, and its PERST# ("apple,radio-perst", on the AP pins). All of it, or the port isn't
+ * trained again and a real sleep is refused while its host is held.
+ */
+static void apple_sleep_map_radio(struct apple_sleep *s)
+{
+	static const char *const rc[] = {
+		"apple,tunable-radio-rc", "apple,tunable-radio-rc-gen3", "apple,tunable-radio-rc-gen4",
+	};
+	struct device_node *np, *pins;
+	struct of_phandle_args args;
+	unsigned int i;
+
+	if (!s->soc->radio_retrain || !s->radio_host_np || !s->pins)
+		return;
+	np = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
+	if (!np)
+		return;
+	s->radio_port = apple_sleep_apcie_block(s->dev, np, "radio-port", "apple,tunable-radio-port",
+						&s->radio_port_tunable);
+	s->radio_lane = apple_sleep_apcie_block(s->dev, np, "radio-lane", NULL, NULL);
+	s->radio_cfg = apple_sleep_apcie_block(s->dev, np, "radio-cfg", NULL, NULL);
+	for (i = 0; i < ARRAY_SIZE(rc); i++)
+		s->radio_rc_tunable[i] = apple_sleep_apcie_tunable(s->dev, np, "radio-cfg", rc[i]);
+	of_node_put(np);
+
+	pins = of_parse_phandle(s->dev->of_node, "apple,pinctrl", 0);
+	if (!of_parse_phandle_with_args(s->dev->of_node, "apple,radio-perst", "#gpio-cells", 0,
+					&args)) {
+		if (args.np == pins && args.args_count >= 2 && args.args[0] < s->npins &&
+		    !test_bit(args.args[0], s->pins_skip)) {
+			s->radio_perst = args.args[0];
+			s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
+		}
+		of_node_put(args.np);
+	}
+	of_node_put(pins);
+
+	s->radio_trainable = s->radio_port && s->radio_lane && s->radio_cfg &&
+			     s->radio_port_tunable && s->radio_rc_tunable[0] &&
+			     s->radio_rc_tunable[1] && s->radio_rc_tunable[2] && s->radio_perst >= 0;
+	if (!s->radio_trainable)
+		dev_info(s->dev, "the radio's port can't be trained after a sleep: a real sleep is refused while its host is bound\n");
+}
+
 static void apple_sleep_map_debug_port(struct apple_sleep *s)
 {
 	struct device_node *np = of_parse_phandle(s->dev->of_node, "apple,debug-port", 0);
@@ -4044,6 +4472,12 @@ static void apple_sleep_map_debug_port(struct apple_sleep *s)
 
 	if (!np)
 		return;
+	/* Its commands are written for the gen 1 layout only. */
+	if (s->soc->spmi_gen4) {
+		dev_warn(s->dev, "apple,debug-port on SPMI gen 4: not driven\n");
+		of_node_put(np);
+		return;
+	}
 	bus = of_get_parent(np);
 	if (bus && !of_property_read_u32_index(np, "reg", 0, &s->hpm_sid))
 		s->hpm_spmi = of_iomap(bus, 0);
@@ -4087,11 +4521,81 @@ static int apple_sleep_alloc_books(struct apple_sleep *s)
 	return 0;
 }
 
+static void apple_sleep_put_node(void *np)
+{
+	of_node_put(np);
+}
+
+#ifdef CONFIG_HIBERNATION
+/*
+ * Restored from a hibernation image (aura hib=1, notes/t8142-hibernation.md), this kernel runs
+ * under the aura of the boot that resumed it. aura moved with the boot object, and its mailbox
+ * with it: the one mapped at probe was the hibernating boot's. Take this boot's from the device
+ * tree aura keeps at its fixed slot, as #1477's T6040 part does in its .restore. Without a valid
+ * one, deep sleep refuses instead of arming memory that is no longer aura's.
+ */
+static int apple_sleep_hib_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_sleep *s = READ_ONCE(apple_sleep);
+	struct aura_s2r_mailbox *mbox = NULL;
+	u64 pa = 0;
+	int ret;
+
+	if (action != PM_POST_HIBERNATION || !s || !pm_hibernate_is_restored())
+		return NOTIFY_DONE;
+	sleep_hib_heartbeat_begin();
+	ret = aura_hibernate_boot_chosen_u64("aurora,s2r-mailbox", &pa);
+	if (!ret) {
+		mbox = memremap(pa, sizeof(*mbox), MEMREMAP_WB);
+		if (!mbox)
+			ret = -ENOMEM;
+	}
+	if (mbox) {
+		/* Written by aura with the MMU off; nothing this kernel cached of that address holds. */
+		dcache_inval_poc((unsigned long)mbox, (unsigned long)(mbox + 1));
+		if (mbox->magic != AURA_S2R_MAGIC || mbox->boot_mpidr != cpu_logical_map(0)) {
+			memunmap(mbox);
+			mbox = NULL;
+			ret = -EINVAL;
+		}
+	}
+	if (!mbox) {
+		WRITE_ONCE(s->mbox_lost, true);
+		dev_warn(s->dev, "restored: this boot's s2r-mailbox is unusable (%d, %#llx): no deep sleep until a reboot\n",
+			 ret, pa);
+		return NOTIFY_DONE;
+	}
+	dev_info(s->dev, "restored: s2r-mailbox %#llx (the probe's mapping was the hibernating boot's)\n",
+		 pa);
+	s->mbox = mbox;
+	WRITE_ONCE(s->mbox_lost, false);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block apple_sleep_hib_nb = {
+	.notifier_call = apple_sleep_hib_notify,
+};
+#endif
+
+
 static int apple_sleep_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct apple_sleep_soc *soc = of_device_get_match_data(dev);
 	struct apple_sleep *s;
 	int ret;
+
+	/* A SoC with its own sequences also has its own conditions, and its own answers. */
+	if (soc && soc->part) {
+		ret = apple_sleep_registry_bind(soc->part->registry_flags);
+		if (ret)
+			return dev_err_probe(dev, ret, "another sleep controller is bound\n");
+		ret = soc->part->probe(pdev);
+		if (ret)
+			apple_sleep_registry_unbind();
+
+		return ret;
+	}
 
 	/* Below EL2 a monitor owns all of this. */
 	if (!is_kernel_in_hyp_mode())
@@ -4106,6 +4610,21 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	s->soc = of_device_get_match_data(dev);
 	if (!s->soc)
 		return -ENODEV;
+	if (s->soc->spmi_gen4) {
+		s->spmi_status = SPMI4_STATUS;
+		s->spmi_rx_empty = SPMI4_STATUS_RX_EMPTY;
+		s->spmi_cmd = SPMI4_CMD;
+		s->spmi_reply = SPMI4_REPLY;
+		s->spmi_notify_enable = SPMI4_NOTIFY_ENABLE;
+		s->spmi_notify_ack = SPMI4_NOTIFY_ACK;
+	} else {
+		s->spmi_status = SPMI_STATUS;
+		s->spmi_rx_empty = SPMI_STATUS_RX_EMPTY;
+		s->spmi_cmd = SPMI_CMD;
+		s->spmi_reply = SPMI_REPLY;
+		s->spmi_notify_enable = SPMI_NOTIFY_ENABLE;
+		s->spmi_notify_ack = SPMI_NOTIFY_ACK;
+	}
 
 	/* Without the boot object's half, a wake would rerun its boot flow. */
 	ret = apple_sleep_map_mailbox(s);
@@ -4141,19 +4660,56 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	apple_sleep_map_apcie(s);
+	if (s->soc->radio_retrain) {
+		s->radio_host_np = of_parse_phandle(dev->of_node, "apple,radio-host", 0);
+		if (s->radio_host_np &&
+		    devm_add_action_or_reset(dev, apple_sleep_put_node, s->radio_host_np))
+			return -ENOMEM;
+	}
 	apple_sleep_map_pins(s);
+	apple_sleep_map_radio(s);
 	apple_sleep_map_debug_port(s);
 
 	platform_set_drvdata(pdev, s);
 
-	ret = spin_table_set_power_ops(&sleep_cpu_power_ops);
+	ret = apple_sleep_registry_bind(APPLE_SLEEP_REG_LID_AT_WAKE |
+				       APPLE_SLEEP_REG_USB_WAKE_PORTS);
 	if (ret)
+		return dev_err_probe(dev, ret, "another sleep controller is bound\n");
+	ret = spin_table_set_power_ops(&sleep_cpu_power_ops);
+	if (ret) {
+		apple_sleep_registry_unbind();
 		return dev_err_probe(dev, ret, "cannot control CPU power\n");
+	}
+	if (s->soc->pen_deep)
+		spin_table_pen_deep_arm(true);
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	apple_sleep = s;
+	apple_sleep_registry_ready();
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(&apple_sleep_ops);
+#ifdef CONFIG_HIBERNATION
+	register_pm_notifier(&apple_sleep_hib_nb);
+	if (s->soc->untested)
+		sleep_hib_notes_init(pdev);
+#endif
+	/* Not on a SoC whose data is derived: there it is asked for by name. */
+	if (s->soc->untested) {
+		if (mem_sleep_current == PM_SUSPEND_MEM)
+			mem_sleep_current = PM_SUSPEND_TO_IDLE;
+		dev_info(dev, "probe: pwrgate wake %#x %#x cpm %#x %#x, commit %#x, clusters %#x %#x\n",
+			 readl(s->pwrgate + s->soc->pwrgate_wake[0]),
+			 readl(s->pwrgate + s->soc->pwrgate_wake[1]),
+			 readl(s->pwrgate + s->soc->pwrgate_cpm[0]),
+			 readl(s->pwrgate + s->soc->pwrgate_cpm[1]), readl(s->commit),
+			 readl(s->cluster + s->soc->cluster_cpu[0]),
+			 readl(s->cluster + s->soc->cluster_cpu[1]));
+		dev_warn(dev, "sleep data derived for this SoC, untested: deep sleep is %s, and %s\n",
+			 READ_ONCE(sleep_deep) ? "offered (apple_sleep.deep=1)" : "off (apple_sleep.deep=1 offers it)",
+			 READ_ONCE(sleep_untested_commit) ? "the commit is allowed" :
+			 "a sleep stops before the commit (dry run)");
+	}
 
 	dev_info(dev, "deep sleep %s: boot object resumes %llu\n",
 		 mem_sleep_current == PM_SUSPEND_MEM ? "is the default" :
@@ -4578,22 +5134,538 @@ static const struct apple_sleep_soc t8132_sleep_soc = {
 	.wake_names = t8132_wake_names,
 	.nwake_names = ARRAY_SIZE(t8132_wake_names),
 	.wake_last_word = GENMASK(20, 0),
+	.quiesce = SLEEP_WORDS(t8132_quiesce_words),
+};
+#if APPLE_SLEEP_T6040
+/* T6040 (MacBook Pro J616s): its own sequences, in sleep-t6040.c. */
+static const struct apple_sleep_soc t6040_sleep_soc = {
+	.part = &t6040_sleep_part,
+};
+#endif
+
+/*
+ * T8142 (M5: MacBook Air J813/J815, MacBook Pro J704). No M5 sleep has been traced: this is
+ * T8132's sleep with T8142's words, translated by name from the J815 ADT and checked against
+ * the macOS 27.2.1 kernelcache (26B131) where the code says more:
+ *  - XNU's last-WFI path is the same code for both SoCs.
+ *  - AppleT8142PMGR's sleep entry and restoreHW are T8132's in order. A complex comes on as
+ *    (word | 0xf), then bit 4 clears; restoreHW then sets pwrgate +0x0 and +0x60, the boot
+ *    cores of E and P, read-modify-write.
+ *  - Its quiescePerfState takes the SoC to 3 and DCS to 3, through 5 from 6 and up, before
+ *    the complexes go off, and adds a "sleep hack" right before the S2R timer:
+ *    PMGR_SOC_CLLT.EARLY_WAKEUP_CFG (+0x50) bits 17:16 cleared. Its EVENT_CFG step calls a
+ *    method that is empty on T8142. The S2R timer is T8132's commit word.
+ *  - The wake block has nine mask words (sources 0..267), then nine status words.
+ *  - No clock mux and no memory-controller lane step: AppleT8142MCC turns the cache's ways
+ *    off as its platform sleep action, which mcc.c does at suspend_noirq.
+ *  - Its SPMI controllers are gen 4.
+ * iBoot leaves the boot core's power-gate enable (+0x60) clear: with it clear the boot core
+ * never powers off in its last WFI, the P complex stays BUSY, and WD2 resets the SoC after
+ * the commit. The DT's cluster power gate sets it at boot (apple-cluster-pwrgate.c), as on
+ * T8132 and T6050.
+ */
+#define T8142_PS_ATC0_COMMON		0x2c8
+#define T8142_PS_AON_ATC0_USB_AON	0xc8
+#define T8142_PS_AON_ATC0_USB		0xd0
+#define T8142_PMC_VOTER_AP		(3 * PMC_VOTER_STRIDE)
+#define T8142_CLUSTER_BUSY		BIT(4)
+/*
+ * AppleT8142PMGR::setPerfState's words in PMGRCLKGEN_SOC_TOP (/arm-io/pmgr reg[2]): the SoC's
+ * at 0x24000, DCS's at 0x25000, each like T8132's: [3:0] asks, [11:8] has reached, bit 31 busy.
+ */
+#define T8142_PERF_REQ			GENMASK(3, 0)
+#define T8142_DCS_SLEEP_STATE		3
+#define T8142_DCS_STEP_STATE		5
+#define T8142_DCS_STEP_FROM		6
+#define T8142_DCS_MAX_STATE		10
+
+/*
+ * Every Linux access to the complexes' ACC word 0xe440f8 has hung J815 so far: a read at
+ * probe, an on-demand read, and the one wake that wrote it (the only T8142 sleep that went
+ * down, then hung on its way back). macOS writes 1 after each complex powers on and at the
+ * end of restoreHW; here that is only done when asked for.
+ */
+static bool sleep_acc_wake;
+module_param_named(acc_wake, sleep_acc_wake, bool, 0644);
+MODULE_PARM_DESC(acc_wake,
+		 "T8142: write ACC 0xe440f8 = 1 per complex at a wake, as restoreHW does (default 0)");
+
+static int t8142_perf_request(void __iomem *reg, unsigned int state)
+{
+	writel((readl(reg) & ~T8142_PERF_REQ) | FIELD_PREP(T8142_PERF_REQ, state), reg);
+	return sleep_perf_wait(reg, state);
+}
+
+/*
+ * AppleT8142PMGR::quiescePerfState, the PMGR's first sleep step: the SoC to Vmin (3), then DCS
+ * to 3, through 5 from 6..10. macOS waits on BUSY with no limit and panics on a DCS state
+ * above 10; here each wait is bounded, and such a state is left alone.
+ */
+static void t8142_perf_down(struct apple_sleep *s)
+{
+	unsigned int state = FIELD_GET(DCS_STATE, readl(s->dcs));
+
+	s->perf_dcs_from = state;
+	s->perf_soc_ret = t8142_perf_request(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE);
+	if (state > T8142_DCS_MAX_STATE) {
+		s->perf_dcs_ret = -ERANGE;
+		return;
+	}
+	if (state >= T8142_DCS_STEP_FROM)
+		t8142_perf_request(s->dcs, T8142_DCS_STEP_STATE);
+	s->perf_dcs_ret = t8142_perf_request(s->dcs, T8142_DCS_SLEEP_STATE);
+}
+
+/* AppleT8142PMGR vtable 0xfa0: each complex's CPM gate word, read-modify-write. */
+static void t8142_cpm_on(struct apple_sleep *s)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(s->soc->pwrgate_cpm); i++) {
+		void __iomem *reg = s->pwrgate + s->soc->pwrgate_cpm[i];
+
+		writel(readl(reg) | PWRGATE_ON, reg);
+	}
+}
+
+/* T8132's, with T8142's ATC0 words; ANS's PCIe block in AppleT8142PCIe's order. */
+static void t8142_lower_io(struct apple_sleep *s)
+{
+	sleep_note(s, 0x61);
+	t8132_clean_ram();
+	sleep_note(s, 0x62);
+	s->atc0_saved[0] = readl(s->ps_aon + T8142_PS_AON_ATC0_USB);
+	s->atc0_saved[1] = readl(s->ps_aon + T8142_PS_AON_ATC0_USB_AON);
+	s->atc0_saved[2] = readl(s->ps + T8142_PS_ATC0_COMMON);
+	t8132_aon_lower(s, T8142_PS_AON_ATC0_USB);
+	if (!READ_ONCE(sleep_usb_asleep))
+		t8132_aon_lower(s, T8142_PS_AON_ATC0_USB_AON);
+	sleep_ps_lower(s, T8142_PS_ATC0_COMMON);
+	if (s->pcie_ans_stopped) {
+		apple_sleep_lower_apcie(s);
+		s->ans_off_ret = sleep_ps_wait_off(s, s->soc->ps.ans);
+	}
+	sleep_note(s, 0x63);
+}
+
+/*
+ * The last note before the cores' window (0x65): +2 flags, +4 the first armed wake source
+ * already pending (low 8 bits; 0xff none). Flags: 0x01 a parked CPU didn't stop, 0x02 the SoC
+ * perf state, 0x04 the DCS state didn't settle, 0x08 an armed wake source is pending, 0x10 it
+ * is >= 256, 0x20 the commit word read non-zero (it reads 1 from boot on J815). No PMU traffic
+ * after it: the engine gives the cores 33 ms from the complex words to their WFI.
+ */
+static void t8142_commit_note(struct apple_sleep *s)
+{
+	u8 flags = 0, src = 0xff;
+	int i;
+
+	if (!sleep_notes_on(s))
+		return;
+	if (s->cpus_stop_ret)
+		flags |= 0x01;
+	if (s->perf_soc_ret)
+		flags |= 0x02;
+	if (s->perf_dcs_ret)
+		flags |= 0x04;
+	for (i = 0; i < s->soc->wake_words; i++) {
+		u32 pend = readl(s->wake + s->soc->wake_status + i * 4) & s->wake_armed[i];
+
+		if (!pend)
+			continue;
+		if (!(flags & 0x08)) {
+			u32 id = i * 32 + __ffs(pend);
+
+			src = id & 0xff;
+			if (id > 0xff)
+				flags |= 0x10;
+		}
+		flags |= 0x08;
+	}
+	if (readl(s->commit))
+		flags |= 0x20;
+	sleep_note_at(s, 2, flags);
+	sleep_note_at(s, 4, src);
+	sleep_note(s, 0x65);
+}
+
+/*
+ * T8132's order after the cores stopped, ATC0 and ANS lowered and WD2: quiescePerfState, the
+ * CPM gates around the AP's PMC vote (agent 3, as T8132's), the complexes off, the quiesce
+ * read, the early wake-up bits off, the words saved.
+ */
+static void t8142_last_mile(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i;
+
+	t8142_perf_down(s);
+	sleep_note(s, 0x64);
+
+	t8142_cpm_on(s);
+	t8142_cpm_on(s);
+	readl(s->pmc_voters + T8142_PMC_VOTER_AP);
+	writel(0, s->pmc_voters + T8142_PMC_VOTER_AP);
+	readl(s->pmc_voters + T8142_PMC_VOTER_AP + 4);
+	t8142_cpm_on(s);
+
+	t8142_commit_note(s);
+
+	for (i = 0; i < soc->ncluster_cpu; i++)
+		writel(0, s->cluster + soc->cluster_cpu[i]);
+
+	s->quiesce_still_on = 0;
+	for (i = 0; i < soc->quiesce.count; i++)
+		if (sleep_ps_on(s, soc->quiesce.offset[i]))
+			s->quiesce_still_on |= BIT(i);
+
+	/* "Applying Sleep hacks": the early wake-up bits off, right before the S2R timer. */
+	for (i = 0; i < soc->ncllt; i++)
+		writel(readl(s->cllt + soc->cllt[i].offset) & ~soc->cllt[i].clear,
+		       s->cllt + soc->cllt[i].offset);
+
+	sleep_ps_save(s);
+}
+
+/*
+ * AppleT8142PMGR's complex power-on: ApplePMGR's cluster method writes (word & ~0xf) | 0xf and
+ * waits for bit 4 to clear; T8142's override then writes 1 to the complex's ACC word.
+ */
+static int t8142_cluster_on(struct apple_sleep *s, u32 word, void __iomem *acc)
+{
+	void __iomem *reg = s->cluster + word;
+	u32 val;
+	int ret;
+
+	writel(readl(reg) | CLUSTER_ON, reg);
+	ret = readl_poll_timeout_atomic(reg, val, !(val & T8142_CLUSTER_BUSY), 1,
+					CLUSTER_TIMEOUT_US);
+	if (!ret && acc && READ_ONCE(sleep_acc_wake))
+		writel(1, acc);
+	return ret;
+}
+
+/*
+ * AppleT8142PMGR::restoreHW: each complex on, pwrgate +0x0 and +0x60 read-modify-written, the
+ * words back, the CPM gates, the ACC words once more. Its two "early wake hacks" (SEP's ps
+ * word, map 0x4e's ten words) are gated by flags its constructor clears and nothing sets.
+ * Then T8132's: ATC0's words, SEP, WD2, ANS's PCIe block and the radio's link.
+ */
+static void t8142_wake(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	u32 val;
+	int i;
+
+	s->cluster_e_ret = t8142_cluster_on(s, soc->cluster_cpu[0], s->acc_e);
+	s->cluster_p_ret = t8142_cluster_on(s, soc->cluster_cpu[1], s->acc_p);
+
+	for (i = 0; i < ARRAY_SIZE(soc->pwrgate_wake); i++) {
+		void __iomem *reg = s->pwrgate + soc->pwrgate_wake[i];
+
+		writel(readl(reg) | PWRGATE_ON, reg);
+	}
+
+	sleep_ps_rewake(s);
+	/* The commit saved ATC0's words already lowered: reverse of the lowering. */
+	sleep_ps_restore(s->ps + T8142_PS_ATC0_COMMON, s->atc0_saved[2]);
+	sleep_ps_restore(s->ps_aon + T8142_PS_AON_ATC0_USB_AON, s->atc0_saved[1]);
+	sleep_ps_restore(s->ps_aon + T8142_PS_AON_ATC0_USB, s->atc0_saved[0]);
+
+	s->deep_ran = sleep_ps_woke_on(s, soc->ps.ap_tmm);
+
+	val = readl(s->ps + soc->ps.sep);
+	if (val & PS_DEV_DISABLE)
+		writel(val & ~PS_DEV_DISABLE, s->ps + soc->ps.sep);
+
+	t8142_cpm_on(s);
+	if (READ_ONCE(sleep_acc_wake) && s->acc_e && s->acc_p) {
+		writel(1, s->acc_e);
+		writel(1, s->acc_p);
+	}
+
+	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
+
+	if (s->pcie_ans_stopped)
+		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
+	/* Before the PCI core restores the radio's functions, which needs the link. */
+	if (s->radio_trainable)
+		s->radio_train_ret = s->pcie_ans_stopped && !s->pcie_ans_on_ret ?
+				     apple_sleep_radio_train(s) : -ENOLINK;
+	s->apcie_port_down = true;
+	s->pins_lost = s->pins_saved_valid;
+}
+
+/* The J815 ADT's /arm-io/pmgr ap-wake-sources, all of them. */
+static const struct apple_sleep_wake_name t8142_wake_names[] = {
+	{ 5, "AOP.CPUWakeupAP" }, { 12, "AOP.GPIO.IRQ4" }, { 14, "AOP.GPIO.IRQ6" },
+	{ 44, "AOP.OutboxNotEmpty" }, { 63, "AOP.SPMI0.SW3" }, { 67, "AOP.SPMI1.SW3" },
+	{ 71, "ATC0.CIOWakeup" }, { 72, "ATC0.USBWakeup" }, { 73, "ATC1.CIOWakeup" },
+	{ 74, "ATC1.USBWakeup" }, { 75, "ATC2.CIOWakeup" }, { 76, "ATC2.USBWakeup" },
+	{ 77, "ATC3.CIOWakeup" }, { 78, "ATC3.USBWakeup" },
+	{ 89, "MTP.DOCK.CHANNELS.AP0.IRQ" }, { 108, "MTP.OutboxNotEmpty" },
+	{ 128, "NUB.APWakeupTime" }, { 129, "PMGR_AON.APWatchdog" }, { 146, "NUB.GPIO.IRQ6" },
+	{ 152, "NUB.SPMI0.SW3" }, { 157, "NUB.SPMI1.SW3" }, { 163, "NUB.WakeupAP" },
+	{ 168, "SMC.CPUWakeupAP" }, { 190, "SMC.OutboxNotEmpty" },
+	{ 237, "AOP.TrustedOutboxNotEmpty" }, { 256, "AOP2.TrustedOutboxNotEmpty" },
+	{ 261, "AOP2.CPUWakeAP" },
 };
 
 /*
- * Only SoCs whose sleep was measured and tested. On every other the driver doesn't bind, and
- * s2idle stays the only sleep.
+ * Every word in the J815 ADT's /arm-io/pmgr power states, in "ps" and in "ps-aon". The lists
+ * after them are T8132's measured ones, each word translated to T8142's by its ADT name; a
+ * T8132 word with no T8142 namesake is dropped (notes/t8142-sleep-RE.md in the J815 tree).
+ */
+/*
+ * Less DCS0..7 (0x1d8, 0x1e0, 0x1e8, 0x1f0, 0x218, 0x220, 0x228, 0x230): DRAM slices, no_ps in
+ * the J815 ADT and left to the memory controller. Reading or writing one at .enter stalled J815
+ * (boot 45257eaf, DCS5 in the match), so neither the dry run's report, the commit's save nor the
+ * rewake after a wake touches them.
+ */
+/*
+ * Also less the 34 words that are OS-managed on T8132 (or absent there) but no_ps in the J815
+ * ADT (PCPM_SRAM, SBR, PMS(_BUSIF), PMGR_SOC_OCLA, PIOGW, the AF* fabrics and AMCC ports, SIO,
+ * FPWM1, TRACE_FAB, DPTX_PHY, ISP_CPU*, ISP_FE, DISP_SMB*): the rewake after a wake writes back
+ * any word of this list whose control bits moved, and on T8142 these are firmware's to move
+ * (rule: t8142_ps_macos_off).
+ */
+static const u32 t8142_ps_all[] = {
+	0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50,
+	0x58, 0x110, 0x118, 0x120, 0x138, 0x140, 0x148, 0x150, 0x158, 0x160,
+	0x168, 0x170, 0x178, 0x180, 0x190, 0x198, 0x1a0, 0x1a8, 0x1b0, 0x290,
+	0x298, 0x2a0, 0x2a8, 0x2b8, 0x2c0, 0x2c8, 0x2d0, 0x2d8, 0x2e0, 0x2e8,
+	0x2f0, 0x2f8, 0x300, 0x308, 0x310, 0x318, 0x320, 0x328, 0x330, 0x340,
+	0x348, 0x350, 0x358, 0x360, 0x368, 0x370, 0x378, 0x380, 0x388, 0x390,
+	0x398, 0x3a0, 0x3a8, 0x3b0, 0x3b8, 0x3c0, 0x3c8, 0x3d0, 0x3d8, 0x3e0,
+	0x3e8, 0x3f0, 0x3f8, 0x400, 0x408, 0x410, 0x418, 0x420, 0x428, 0x430,
+	0x438, 0x440, 0x448, 0x450, 0x458, 0x460, 0x468, 0x470, 0x478, 0x480,
+	0x488, 0x490, 0x498, 0x4a0, 0x4a8, 0x4b0, 0x4b8, 0x4c0, 0x4c8, 0x4d0,
+	0x4d8, 0x4e0, 0x4e8, 0x4f0, 0x4f8, 0x500, 0x508, 0x510, 0x518, 0x520,
+	0x528, 0x530, 0x538, 0x540, 0x548, 0x550, 0x558, 0x560, 0x568, 0x570,
+	0x578, 0x580, 0x598, 0x5a0, 0xc00, 0x4020, 0x4028, 0x4030, 0x4038, 0x4040,
+	0x4048, 0x4050, 0x4058, 0x4060, 0x8000, 0x8008, 0x8010, 0x8018, 0x8020, 0xc000,
+	0xc008, 0xc010, 0x10000, 0x10008, 0x10010, 0x10018, 0x10020, 0x10028, 0x10030, 0x10038,
+	0x10040, 0x10048, 0x10050, 0x10068, 0x10070, 0x10078,
+};
+
+/*
+ * Less the 9 AON words T8142 took from the OS (no_ps here, OS-managed or absent on T8132):
+ * NUB_AON, NUB_OCLA, NUB_FABRIC, NUB_SRAM, DEBUG_SWITCH, AOP_DART, AOP_I2CM3, AOP2_PIODMA,
+ * AOP2_CPU. Same reason as t8142_ps_all.
+ */
+static const u32 t8142_ps_aon_all[] = {
+	0x58, 0x60, 0x68, 0x70, 0x78, 0x88, 0x98, 0xa0, 0xa8, 0xc8,
+	0xd0, 0xd8, 0xe0, 0xe8, 0xf0, 0xf8, 0x100, 0x4000, 0x4008, 0x4010,
+	0x4018, 0x4028, 0x4030, 0x4038, 0x4048, 0x4050, 0x4058, 0x4060, 0x4068, 0x4070,
+	0x4078, 0x4080, 0x4088, 0x4090, 0x40a0, 0x40a8, 0x40b8, 0x40c0, 0x40c8, 0x40d0,
+	0x40d8, 0x40e0, 0x40e8, 0x40f0, 0x40f8, 0x4100, 0x4108, 0x4110, 0x4118, 0x4120,
+	0x4128, 0x4130, 0x4138, 0x4140, 0x4148, 0x4150, 0x4158, 0x4160, 0x4168, 0x4170,
+	0x4178, 0x4180, 0x4188, 0x8000, 0x8008, 0x8010, 0x8018, 0x8020, 0x8028, 0x8030,
+	0x8038, 0x8040, 0x8048, 0x8050, 0x8058, 0x8060, 0x8068, 0x8070, 0x8078, 0x8080,
+	0x8088, 0xc000, 0xc008, 0xc010, 0xc018, 0xc020, 0xc028, 0xc030, 0xc038, 0xc040,
+	0xc048, 0xc050, 0xc058, 0xc060,
+};
+
+/* Less DPTX_PHY (0x590): no_ps on T8142 (see t8142_ps_macos_off). */
+static const u32 t8142_ps_wake_order[] = {
+	0xc00, 0x118, 0x120, 0x180, 0x390, 0x398, 0x468, 0x470, 0x478, 0x480,
+	0x488, 0x598, 0x5a0, 0x300, 0x2f0, 0x408, 0x410, 0x520, 0x560, 0x328,
+	0x2a8, 0x320, 0x2b8, 0x3a8, 0x3b8, 0x290, 0x318, 0x10000, 0x308, 0x418,
+	0x428, 0x440, 0x360,
+};
+
+static const u32 t8142_ps_aon_wake_order[] = {
+	0xa8,
+};
+
+/*
+ * T8132's match raises its AFIMCCNI0/1, FAB_AFC0, AMCC0/1, DCS5 and DCS7 (and DWI). On T8142 every
+ * one of those, by name or by its split (AFCMCCNI0, AMCC0_P0..P3), is no_ps in the J815 ADT: the
+ * memory path's words belong to firmware there, and J815 stalled the first time a sleep wrote
+ * one (DCS5, boot 45257eaf). T8142 raises none; see t8142_ps_macos_off for the rule.
+ */
+
+/*
+ * T8132's lowered words by name, less those T8142 took out of the OS's hands: ISP_FE,
+ * ISP_CPU_CORE1/0, ISP_CPU, DPTX_PHY, TRACE_FAB, FPWM1 and AFIAFT are OS-managed on T8132 but
+ * no_ps in the J815 ADT (FPWM1 next to T8142's own no_ps SMC_FPWM0..3). J815 stalled lowering
+ * FPWM1 (boot b7f0f04d: PMU note 0x47, phase 5, index 44). The rule for T8142's sleep lists:
+ * no word the J815 ADT marks no_ps, unless T8132 writes the same no_ps word (its AON audio ones).
+ */
+static const u32 t8142_ps_macos_off[] = {
+	0xc010, 0xc008, 0xc000, 0x8020, 0x8018, 0x8010, 0x8008, 0x8000, 0x510, 0x508,
+	0x500, 0x4f8, 0x4f0, 0x4e8, 0x4e0, 0x4d8, 0x460, 0x458, 0x450, 0x448,
+	0x440, 0x438, 0x430, 0x400, 0x3f8, 0x3f0, 0x3e8, 0x3e0, 0x3d8, 0x3d0,
+	0x3c8, 0x3c0, 0x3a0, 0x368, 0x360, 0x358, 0x350, 0x348, 0x320, 0x310,
+	0x2f8, 0x2e8, 0x2e0, 0x2d8, 0x2d0, 0x2c0, 0x2a8, 0x2a0, 0x298, 0x1b0,
+	0x198, 0x190, 0x178, 0x170,
+};
+
+static const u32 t8142_ps_aon_macos_off[] = {
+	0x4180, 0x4108, 0x40f8, 0x40d8, 0x40b8, 0x4080, 0x100, 0xf8, 0xf0, 0xe8,
+	0xe0, 0xd8,
+};
+
+static const u32 t8142_ps_aon_macos_on[] = {
+	0x40e0, 0x40e8, 0x4118, 0x4138, 0x4148, 0x4150, 0x4158,
+};
+
+/*
+ * T8132's quiesce words by name: the ATC commons, the display's and DISPEXT's SYS, ANS, AVD,
+ * VENC, JPG and APCIE's SYS_GP. GFX's is in its own block here.
+ */
+static const u32 t8142_quiesce_words[] = {
+	0x2c8, 0x2d0, 0x2d8, 0x2e0, 0x290, 0x308, 0x2b8, 0x300, 0x310, 0x298,
+	0x2a0, 0x408,
+};
+static_assert(ARRAY_SIZE(t8142_quiesce_words) <= 32);
+
+static const struct apple_sleep_word t8142_stray_words[] = {
+	{ "AVD_SYS", 0x310 }, { "VENC_SYS", 0x298 }, { "JPG", 0x2a0 },
+};
+
+static const struct apple_sleep_word t8142_gate_off[] = {
+	{ "ane_sys", 0x2e8 }, { "isp_sys", 0x2f8 }, { "avd_sys", 0x310 },
+	{ "jpg", 0x2a0 }, { "venc_sys", 0x298 },
+};
+
+/* T8142's, from the J815 tree. GFX's word is in its own block, not "ps". */
+static const struct apple_sleep_gate_coproc t8142_gate_coprocs[] = {
+	{ "/soc/dcp@286e00000", true, 0x10000 },
+	{ "/soc/pmp@380500000", true },
+	{ "/soc/nvme@4c5cc0000" },	{ "/soc/mtp@394600000" },
+	{ "/soc/aop@390c00000" },	{ "/soc/smc@38c600000" },
+	{ "/soc/sep@30a600000" },
+	{ "/soc/gpu@582600000", true },
+};
+
+
+static const struct apple_sleep_ops t8142_sleep_ops = {
+	/* XNU's last-WFI helper is the same code as T8132's and T8140's. */
+	.deep_wfi_arm = t8140_deep_wfi_arm,
+	.lower_io = t8142_lower_io,
+	.last_mile = t8142_last_mile,
+	/* WD2 is at T8132's address (/arm-io/wdt), so the same stub restarts it. */
+	.resume = t8132_resume_stub,
+	.pre_commit = t8132_pre_commit,
+	.wake = t8142_wake,
+	.aic_mask_all = aic_sleep_mask_all,
+	.aic_ack = aic_sleep_ack,
+	.aic_restore = aic_sleep_restore,
+};
+
+static const char *const t8142_regs_absent[] = {
+	"pmc-dcp", "clk-mux", "ptd", "cluster-dcs", "dvfm-e", "dvfm-p", NULL,
+};
+
+static const struct apple_sleep_soc t8142_sleep_soc = {
+	.ops = &t8142_sleep_ops,
+	.untested = true,
+	.regs_absent = t8142_regs_absent,
+	.spmi_gen4 = true,
+	.boot_wfi_delay_ms = 3,
+	.wake_optional = true,
+	/* The J815 tree has no external DCP: DISPEXT0/1 are 0x428/0x418/0x308, 0x3b8/0x3a8/0x2b8. */
+	.ndisp = 1,
+	.display_order = { 0 },
+	/* E, P (ADT soc-clusters) */
+	.cluster_cpu = { 0x0, 0x4 },
+	.ncluster_cpu = 2,
+	/* Six E cores: E bits 0-5, P bits 6-9, the boot core P0. */
+	.cpu_start_stride = 6,
+	.cllt = { { 0x50, GENMASK(17, 16) } },
+	.ncllt = 1,
+	/* The same PMU, and the same boot-stage byte, as T8132 (J815 ADT info-leg_scrpad). */
+	.pmu_usid = 0xe,
+	.pmu_sleep_reg = 0xf801,
+	.pmu_sleep_val = 0x50,
+	.spmi_notify_sleep = 0x2000001,
+	.wake_mask = 0x08,
+	/* AppleT8142PMGR, 27.2.1: masks at map 0x42 + 0x08..0x28, status 0x2c..0x4c */
+	.wake_status = 0x2c,
+	.wake_words = 9,
+	.ps = {
+		.disp = {
+			{ 0x10000, 0x318, 0x290 },
+		},
+		.sio_cpu = 0x328,
+		.sep = 0xc00,
+		.ap_tmm = 0x1b0,
+		.gpio = 0x120,
+		.ans = 0x300,
+		.apcie_gp = 0x2f0,
+		.apcie_sys_gp = 0x408,
+		.apcie_st = 0x410,
+		.apcie_sys_st = 0x520,
+		.apcie_phy_sw = 0x560,
+		.apcie_aus5_aon = 0x578,
+		.apcie_aus5 = 0x580,
+	},
+	.ps_aon_debug_switch = 0xc0,
+	/* ADT /arm-io/apcie: the PHY-PHY block (reg[3]) is 0x20000 into the PHY's (reg[2]). */
+	.apcie_phy_ctrl = 0x20000,
+	.apcie_gen4 = true,
+	.radio_retrain = true,
+	.pen_deep = true,
+	.pwrgate_wake = { 0x000, 0x060 },
+	/* AppleT8142PMGR vtable 0xfa0: 0xa0 + 8 * complex */
+	.pwrgate_cpm = { 0x0a0, 0x0a8 },
+	/* DISP_CPU's retention words: the J815 pmgr's retention_config_ff/_mem (device 0xb7) */
+	.pwrgate_disp = { { 0x11cc, 0x11f0 } },
+	.ps_all = SLEEP_WORDS(t8142_ps_all),
+	.ps_aon_all = SLEEP_WORDS(t8142_ps_aon_all),
+	.ps_macos_off = SLEEP_WORDS(t8142_ps_macos_off),
+	.ps_aon_macos_off = SLEEP_WORDS(t8142_ps_aon_macos_off),
+	.ps_aon_macos_on = SLEEP_WORDS(t8142_ps_aon_macos_on),
+	.ps_wake_order = SLEEP_WORDS(t8142_ps_wake_order),
+	.ps_aon_wake_order = SLEEP_WORDS(t8142_ps_aon_wake_order),
+	.quiesce = SLEEP_WORDS(t8142_quiesce_words),
+	.stray = t8142_stray_words,
+	.nstray = ARRAY_SIZE(t8142_stray_words),
+	.gate_off = t8142_gate_off,
+	.ngate_off = ARRAY_SIZE(t8142_gate_off),
+	.gate_coprocs = t8142_gate_coprocs,
+	.ngate_coprocs = ARRAY_SIZE(t8142_gate_coprocs),
+	.wake_names = t8142_wake_names,
+	.nwake_names = ARRAY_SIZE(t8142_wake_names),
+	/* AppleT8142PMGR's valid-source table: word 8 holds sources 256..267. */
+	.wake_last_word = GENMASK(11, 0),
+};
+
+/*
+ * SoCs whose sleep was measured and tested, and T8142, whose data is derived and which stops
+ * at a dry run unless asked otherwise. On every other the driver doesn't bind, and s2idle
+ * stays the only sleep.
  */
 static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8140-sleep", .data = &t8140_sleep_soc },
 	{ .compatible = "apple,t8132-sleep", .data = &t8132_sleep_soc },
+	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
+#if APPLE_SLEEP_T6040
+	{ .compatible = "apple,t6040-sleep", .data = &t6040_sleep_soc },
+#endif
 	{ }
+};
+
+static int apple_sleep_restore(struct device *dev)
+{
+	const struct apple_sleep_soc *soc = of_device_get_match_data(dev);
+
+	if (soc && soc->part && soc->part->restore)
+		return soc->part->restore(dev);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_sleep_pm_ops = {
+	.restore = pm_sleep_ptr(apple_sleep_restore),
 };
 
 static struct platform_driver apple_sleep_driver = {
 	.driver = {
 		.name = "apple-sleep",
 		.of_match_table = apple_sleep_of_match,
+		.pm = pm_sleep_ptr(&apple_sleep_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 	.probe = apple_sleep_probe,

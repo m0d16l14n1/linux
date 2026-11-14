@@ -158,6 +158,8 @@ struct Graph {
     /// The M5 board, whose part selects the M5 descriptor words.
     board: Option<&'static Board>,
     program: ComputeProgram,
+    /// The firmware takes MCache tables in compute kick entries.
+    mcache: bool,
 }
 
 impl Graph {
@@ -170,6 +172,7 @@ impl Graph {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
@@ -256,7 +259,77 @@ impl Graph {
             operand_state,
             board,
             program,
+            mcache,
         })
+    }
+
+    /// Rewrites the firmware-visible storage of this QID to its construction contents for
+    /// `context` (the bound owner's, which the queue record names after an owner change),
+    /// in place: zero cursors, a fresh queue record, job list and support words, and zero
+    /// scratch. For a cold-restarted firmware that never saw this queue; GPU idle.
+    fn reset_after_cold_boot(&mut self, context: &Context) -> Result {
+        let page = mmu::UAT_PGSZ as u64;
+        let pointers = self.pointers;
+        let graph_va = self.graph.gpu_va();
+        let record = QueueRecordArgs {
+            pointers_va: graph_va + CURSORS as u64,
+            items_va: graph_va + ITEMS as u64,
+            job_list_va: context.work_head_va(),
+            scheduler_va: context.scheduler_va(),
+            owner_pid: context.owner_pid(),
+            policy: context.policy(),
+        };
+        // As `Graph::new` writes it, in the family's own record format.
+        let m5 = self.m5;
+        self.graph.bytes_mut().fill(0);
+        self.graph.initialize::<GraphLayout>(0, |view| {
+            if !m5 {
+                view.queue = QueueRecord::new(&record);
+            }
+            view.pointers = PointerBlock::new(&pointers)?;
+            view.jobs = JobListHead::new(graph_va + 0x200);
+            Ok(())
+        })?;
+        self.graph.initialize::<PointerBlock>(CURSORS, |view| {
+            *view = PointerBlock::new(&pointers)?;
+            Ok(())
+        })?;
+        if self.m5 {
+            // The M5 record is shorter than the G17P slot; the rest of the slot stays zero.
+            self.graph
+                .write(0, crate::g17::fw::m5::queue::QueueRecord::new(&record)?)?;
+        }
+        // The M5 support page is firmware-only and starts zero; G17P's carries its pointers.
+        self.support.bytes_mut().fill(0);
+        if !self.m5 {
+            let support_va = self.support.gpu_va();
+            self.support.write(0, support_va + page)?;
+            self.support.write(0x100, support_va + page + 4)?;
+            self.support.write(0x110, 0x50u32)?;
+            self.support.write(mmu::UAT_PGSZ + 4, 1u32)?;
+        }
+        if let Some(timestamps) = self.m5_timestamps.as_ref() {
+            // Shared with the commands that name its slots, none of which is outstanding.
+            let size = timestamps.size();
+            let pointer = timestamps.pointer(0, size)?;
+            // SAFETY: The checked range stays mapped; the cold firmware never ran this queue
+            // and the host holds no command of it (`cold_resettable`).
+            unsafe { pointer.write_bytes(0, size) };
+        }
+        for object in [&mut self.preempt, &mut self.usage, &mut self.operand, &mut self.records] {
+            object.bytes_mut().fill(0);
+        }
+        for object in [self.context_low.as_mut(), self.context_high.as_mut()].into_iter().flatten() {
+            object.bytes_mut().fill(0);
+        }
+        self.cached_records.bytes_mut().fill(0);
+        if let Some(ring) = self.ring.as_mut() {
+            ring.object.bytes_mut().fill(0);
+        }
+        self.record_ends = [None; RECORD_SLOTS];
+        self.reclaimed = 0;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// All fallible mapping work finishes before replacing a physical queue's logical owner.
@@ -537,6 +610,11 @@ struct Previous<B = Binding, C = Arc<Context>> {
     /// so a rollback leaves the queue detached instead of restoring them.
     moved: bool,
 }
+
+/// A previous binding a cold reset dropped (its replacement was never published, and the
+/// cold-restarted firmware knew neither owner): its aliases into the old VM and its context
+/// reference, dropped by the caller after the device mutex is released.
+pub(crate) struct RetiredPrevious(#[allow(dead_code)] Previous);
 impl<B, C> Previous<B, C> {
     /// The exact drain witness covers the replacement publication even when
     /// its public fence failed. An unpublished replacement still needs rollback.
@@ -720,10 +798,12 @@ impl Queue {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let (active, replays) = (Fifo::new()?, Fifo::new()?);
-        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5)?;
+        let mut graph =
+            Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5, mcache)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
@@ -785,6 +865,96 @@ impl Queue {
             source_hint: crate::g17::sync_input::ReaderHint::new(),
         })
     }
+    /// Whether a cold-restarted firmware can take this queue over as a first install
+    /// ([`Self::reset_after_cold_boot`]): bound to a live owner, idle, with nothing the
+    /// previous firmware still owed it (release, kill, witness, replay, growth).
+    ///
+    /// A previous binding whose replacement (the new owner's first command) was never
+    /// published owes the firmware nothing; the cold reset drops it (no rollback target).
+    pub(crate) fn cold_resettable(&self) -> bool {
+        self.cold_blockers() == 0
+    }
+
+    /// The [`Self::cold_resettable`] conditions that fail, as bits (logged by a refused
+    /// hibernation): 1 no owner, 2 no binding, 4 published owner change not witnessed,
+    /// 8 active, 0x10 replays, 0x20 exit, 0x40 claims, 0x80 quarantined, 0x100 terminal,
+    /// 0x200 growing, 0x400 awaiting witness, 0x800 retire pending, 0x1000 needs fresh
+    /// backing, 0x2000 release sent, 0x4000 pool not populated, 0x8000 no ring.
+    pub(crate) fn cold_blockers(&self) -> u32 {
+        let checks = [
+            self.owner.is_none(),
+            self.binding.is_none(),
+            self.previous.as_ref().is_some_and(|p| p.publication.is_some()),
+            self.active.len != 0,
+            self.replays.len != 0,
+            self.exit.is_some(),
+            self.claims != 0,
+            self.quarantined,
+            self.terminal.is_some(),
+            self.growing,
+            self.awaiting_witness,
+            self.retire_pending,
+            self.needs_fresh_backing,
+            self.release_sent_ns.is_some(),
+            !self.pool.populated(),
+            self.graph.ring.is_none(),
+        ];
+        checks
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (bit, failed)| if *failed { bits | 1 << bit } else { bits })
+    }
+
+    /// Returns a [`Self::cold_resettable`] queue to the state [`Self::new`] leaves, without
+    /// reallocating or remapping anything: the next command installs the queue with the
+    /// cold-restarted firmware (install configuration, first descriptor, predecessor, QID
+    /// publication). Its ordinal restarts with its kick ring. The caller rewrites the pool's
+    /// page-pool descriptor row with the returned descriptor (the family's format) and marks
+    /// the QID unpublished.
+    ///
+    /// A never-published owner change has nothing to roll back to: the cold firmware never
+    /// ran either owner. Its previous binding is taken out and returned for an off-lock drop,
+    /// so a release of the new owner before its first command takes the cancel path.
+    pub(crate) fn reset_after_cold_boot(
+        &mut self,
+    ) -> Result<(PoolDescriptor, Option<RetiredPrevious>)> {
+        if !self.cold_resettable() {
+            return Err(EBUSY);
+        }
+        let context = self.binding.as_ref().ok_or(EIO)?.context.clone();
+        self.graph.reset_after_cold_boot(&context)?;
+        self.kick.reset_after_cold_boot()?;
+        let row = self.pool.reset_after_cold_boot()?;
+        self.installed = false;
+        // M5: the next publication installs the queue first (`install_m5`).
+        self.m5_install = None;
+        self.outer_started = 0;
+        self.published_config = None;
+        self.config_cache = None;
+        self.unpublished_binding = true;
+        self.free_list_generation = 0;
+        self.ordinal = 0;
+        self.submitted = 0;
+        self.fault_stamp = None;
+        self.kill_wait = None;
+        self.released = false;
+        self.retirement_ready = false;
+        self.retired_by_teardown = false;
+        self.spared_quarantine = false;
+        self.spared_deferred = false;
+        self.quarantine_error = None;
+        self.failure_status_pending = false;
+        self.retirement_proved = false;
+        self.replay_retirement = false;
+        self.replay_error = None;
+        self.replay_prepared = false;
+        self.pool_phase = PoolPhase::Populated;
+        self.retained_owner = None;
+        // cold_resettable() admits only an unpublished previous.
+        let previous = self.previous.take().map(RetiredPrevious);
+        Ok((row, previous))
+    }
+
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
     /// zero-duration completion record for it, which quarantines the queue, but stores no
     /// stamp: without this the quarantine would wait for its retirement witness forever and
@@ -2571,6 +2741,7 @@ impl Queue {
             cdm_end_va,
             sampler_heap_va,
             sampler_count,
+            attachments,
             ..
         } = &packet.command
         else {
@@ -2597,6 +2768,15 @@ impl Queue {
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
+        // The kick names the buffers the dispatch writes in an MCache table, as a fragment
+        // kick names its attachments.
+        let mcache_writes = if self.graph.mcache && !self.graph.m5 {
+            attachments.as_slice()
+        } else {
+            &[][..]
+        };
+        let mcache_context: u8 = packet.context.id().try_into()?;
+        let mcache = ComputeDescriptor::mcache_table(descriptor_low, mcache_writes.len())?;
         let first = self.ordinal == 0 && (self.graph.m5 || !self.installed);
         // The first prototype only waits on an installed consumer channel.
         // A retry without a published source falls back to completion on CPU.
@@ -2768,7 +2948,7 @@ impl Queue {
                 slot: identity.qos,
                 class: COMPUTE_QOS_CLASS,
             },
-            mcache: None,
+            mcache,
             event_mask: match m5_board {
                 Some(board) => crate::g17::fw::m5::compute::kick_event_mask(board, identity.context)?,
                 None => COMPUTE_KICK_EVENT_MASK,
@@ -2811,7 +2991,10 @@ impl Queue {
                 object.initialize::<crate::g17::fw::m5::compute::Descriptor>(offset,
                     |descriptor| descriptor.write_zeroed(m5_args))?;
             } else {
-                object.initialize::<ComputeDescriptor>(offset, |descriptor| descriptor.write_zeroed(&args))?;
+                object.initialize::<ComputeDescriptor>(offset, |descriptor| {
+                    descriptor.write_zeroed(&args)?;
+                    descriptor.write_mcache(mcache_writes, mcache_context)
+                })?;
             }
             if !self.graph.m5 && first {
                 self.graph.context_high.as_mut().ok_or(EINVAL)?.write(
@@ -2974,7 +3157,9 @@ impl Queue {
                 None => self.graph.append(producer, announce_va, || {})?,
             };
             fence(Ordering::SeqCst);
-            if entry_signal && !self.graph.m5 {
+            // Only the first kick installs a predecessor record. A later kick that names another
+            // queue's kick depends on it through the kick entry alone.
+            if first && !self.graph.m5 {
                 let predecessor_va =
                     self.graph
                         .record(record_slot, PREDECESSOR, 0x400, predecessor)?;
@@ -3511,6 +3696,7 @@ impl Queue {
         source: &crate::g17::sync_input::Source,
         status: &Arc<VmStatus>,
         epoch: u64,
+        consumer: &crate::g17::context::Context,
     ) -> Result<Option<SourceDependency>> {
         for active in self.active.iter() {
             if !active.packet.completion.is_input_source(&source.submission) {
@@ -3543,6 +3729,7 @@ impl Queue {
                 self.graph.support.gpu_va() + STAMP as u64,
                 u32::from(self.qid()),
                 hold,
+                active.packet.context.shares_execution(consumer),
             )));
         }
         Ok(None)
@@ -3560,11 +3747,13 @@ impl Queue {
     }
 }
 
-/// Publication, dependency, stamp address, queue and the retained source hold.
+/// Publication, dependency, stamp address, queue, the retained source hold and whether the
+/// source shares the consumer's execution context.
 pub(crate) type SourceDependency = (
     u64,
     crate::g17::fw::kick::KickDependency,
     u64,
     u32,
     crate::g17::sync_input::Hold,
+    bool,
 );

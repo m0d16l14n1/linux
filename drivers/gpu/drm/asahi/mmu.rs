@@ -1279,6 +1279,10 @@ impl ExecutionContext {
         if self.root.released.load(Ordering::Acquire) {
             return false;
         }
+        if self.root.inner.reserved_stale() {
+            return inner.execution_roots[usize::from(self.root.id)]
+                == (self.root.low, self.root.high);
+        }
         let roots = &inner.ttbs()[usize::from(self.root.id)];
         roots.ttb0.load(Ordering::Acquire) == self.root.low
             && roots.ttb1.load(Ordering::Acquire) == self.root.high
@@ -1291,8 +1295,19 @@ impl ExecutionRoot {
             return;
         }
         let id = usize::from(self.id);
+        let mut inner = self.inner.lock();
+        if self.inner.reserved_stale() {
+            // The TTBAT is not the host's until it is written from the shadow: release the
+            // shadow entry only, which keeps the context out of that rewrite.
+            if inner.execution_roots[id] == (self.low, self.high) {
+                inner.execution_roots[id] = (0, 0);
+                inner.execution_contexts &= !(1u64 << id);
+            } else {
+                pr_err!("MMU: application context {} changed owners while leased\n", id);
+            }
+            return;
+        }
         let release = {
-            let inner = self.inner.lock();
             inner.handoff_lock();
             let roots = &inner.ttbs()[id];
             let low = roots.ttb0.load(Ordering::Acquire);
@@ -1306,6 +1321,10 @@ impl ExecutionRoot {
             inner.handoff_unlock();
             owned || (low == 0 && high == 0)
         };
+        drop(inner);
+        if release {
+            self.inner.lock().execution_roots[id] = (0, 0);
+        }
         if release {
             mem::sync();
             mem::tlbi_asid(self.id);
@@ -2002,8 +2021,14 @@ struct UatShared {
     /// Expected lower words of user roots owned by the VM slot allocator. Replaced only by
     /// successful host publications, never learned by accepting observed hardware words.
     owned_user_roots: [u64; UAT_NUM_CTX],
+    /// The TTBAT words of every live execution context (`ttb0`, `ttb1`), zero for a free one:
+    /// the host's record of what it published, for a TTBAT that a resume from disk did not
+    /// restore ([`Uat::reset_after_cold_boot`]).
+    execution_roots: [(u64, u64); UAT_NUM_CTX],
     /// Kernel root of the secondary firmware instance, if there is one.
     secondary_ttb1: Option<PhysicalAddr>,
+    /// The kernel root's entries saved at a hibernation freeze ([`Uat::save_host_root_entries`]).
+    saved_roots: KVec<u64>,
     map_kernel_to_user: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
@@ -2107,6 +2132,19 @@ struct UatInner {
     m4_adopted: bool,
     /// An uncertain mapping/root is retained; future M4 allocation and publication fail.
     failed: AtomicBool,
+    /// The TTBAT is not the host's (set with the stale reserved tables when a hibernation
+    /// freeze completes): execution contexts are tracked in `UatShared::execution_roots` only.
+    /// Changed only under the shared lock; cleared at the end of [`Uat::thaw_reserved_state`],
+    /// after the TTBAT was written from the shadow, separately from the table flag, which the
+    /// relink clears earlier.
+    ttbat_shadowed: AtomicBool,
+    /// The kernel root's top-level entries up to the kernel window as the first firmware
+    /// boot published them ([`Uat::adopt_firmware_root_entries`]); a firmware cold-restarted
+    /// after a hibernation must publish the same ones ([`Uat::readopt_firmware_root_entries`]).
+    /// Written once, before anything else reads them.
+    adopted_roots: [AtomicU64; 3],
+    /// Whether [`Self::adopted_roots`] holds a first-boot snapshot.
+    roots_adopted: AtomicBool,
     /// Clean page tables to the point of coherency for a walker that does not snoop the CPU
     /// caches: [`Uat::new_adopted`], and [`UatQuirks::clean_tables`] otherwise.
     clean_poc: bool,
@@ -2192,6 +2230,12 @@ pub(crate) struct M4HandoffGuard<'a> {
 }
 
 impl UatInner {
+    /// The TTBAT does not hold the host's state ([`UatInner::ttbat_shadowed`]); the
+    /// `execution_roots` shadow is authoritative. Read with the shared lock held.
+    fn reserved_stale(&self) -> bool {
+        self.ttbat_shadowed.load(Ordering::Acquire)
+    }
+
     /// Take the lock on the shared data and return the guard.
     fn lock(&self) -> Guard<'_, UatShared, MutexBackend> {
         self.shared.lock()
@@ -3547,6 +3591,9 @@ impl Uat {
                 firmware: UatFirmware::Handoff,
                 m4_adopted: !map_kernel_to_user,
                 failed: AtomicBool::new(false),
+                ttbat_shadowed: AtomicBool::new(false),
+                adopted_roots: [const { AtomicU64::new(0) }; 3],
+                roots_adopted: AtomicBool::new(false),
                 // The G15 UAT walker does not snoop the CPU caches.
                 clean_poc: true,
                 reserved: None,
@@ -3567,7 +3614,9 @@ impl Uat {
                         binding_generations: [0; UAT_NUM_CTX],
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
+                        execution_roots: [(0, 0); UAT_NUM_CTX],
                         secondary_ttb1: None,
+                        saved_roots: KVec::new(),
                         map_kernel_to_user,
                         handoff_rgn,
                         ttbs_rgn,
@@ -3928,7 +3977,15 @@ impl Uat {
             GFP_KERNEL,
         )?;
         {
-            let inner = self.inner.lock();
+            let mut inner = self.inner.lock();
+            if self.inner.reserved_stale() {
+                // Published by the republish's TTBAT rewrite.
+                if inner.execution_roots[id] != (0, 0) {
+                    return Err(EBUSY);
+                }
+                inner.execution_roots[id] = (low, high);
+                return Ok(context);
+            }
             let roots = &inner.ttbs()[id];
             if roots.ttb0.load(Ordering::Acquire) != 0 || roots.ttb1.load(Ordering::Acquire) != 0 {
                 return Err(EBUSY);
@@ -3936,6 +3993,7 @@ impl Uat {
             roots.ttb0.store(low, Ordering::Release);
             roots.ttb1.store(high, Ordering::Release);
             inner.publish_slot(id);
+            inner.execution_roots[id] = (low, high);
         }
         mem::sync();
         mem::tlbi_asid(id as u8);
@@ -4013,6 +4071,113 @@ impl Uat {
     /// cleared. Must run after the primary instance booted and before anything is mapped into the
     /// kernel `Vm`.
     pub(crate) fn adopt_firmware_root_entries(&self) -> Result<[u64; 3]> {
+        let snapshot = self.take_firmware_root_entries()?;
+        for (kept, value) in self.inner.adopted_roots.iter().zip(snapshot) {
+            kept.store(value, Ordering::Relaxed);
+        }
+        self.inner.roots_adopted.store(true, Ordering::Release);
+        Ok(snapshot)
+    }
+
+    /// Whether a first boot adopted the firmware's root entries, so that a cold restart can
+    /// check them again ([`Self::readopt_firmware_root_entries`]).
+    pub(crate) fn firmware_roots_adopted(&self) -> bool {
+        self.inner.roots_adopted.load(Ordering::Acquire)
+    }
+
+    /// [`Self::adopt_firmware_root_entries`] for a firmware cold-restarted after a hibernation
+    /// restore: the no-map root is not in the image, and the firmware rebuilt it as it booted.
+    /// The entries up to the kernel window must be the ones the first boot adopted (the kernel
+    /// window entry names the same bootloader-reserved table, under which the restored kernel
+    /// VM's recorded links are stored again), and the entries above it are cleared again.
+    /// `EIO` with the differing words logged otherwise: every host mapping beneath them would
+    /// be unreachable.
+    pub(crate) fn readopt_firmware_root_entries(&self) -> Result<[u64; 3]> {
+        if !self.firmware_roots_adopted() {
+            return Err(EINVAL);
+        }
+        let expected: [u64; 3] =
+            core::array::from_fn(|index| self.inner.adopted_roots[index].load(Ordering::Relaxed));
+        let current = self.take_firmware_root_entries()?;
+        if current != expected {
+            // The boot loader staged the firmware anew for this boot; its own top-level tables
+            // are what it walks now, so they are what the host keeps (and confirms later).
+            dev_warn!(
+                self.dev.as_ref(),
+                "MMU: cold-restarted firmware published root entries {:#x?}, first boot {:#x?}: adopting the new ones\n",
+                current,
+                expected
+            );
+            for (kept, value) in self.inner.adopted_roots.iter().zip(current) {
+                kept.store(value, Ordering::Relaxed);
+            }
+        }
+        Ok(current)
+    }
+
+    /// At a hibernation freeze: copies every entry of the kernel root. The root is the boot
+    /// loader's reserved `pagetables` page, which no image holds, so after the cold boot that
+    /// restores the image it holds only the firmware's entries: the host's kernel-window tables
+    /// above them (RAM, in the image) are unlinked until [`Self::restore_host_root_entries`].
+    /// Returns the number of host entries saved.
+    pub(crate) fn save_host_root_entries(&self) -> Result<usize> {
+        let count = UAT_PGSZ / size_of::<u64>();
+        let owned = IOVA_KERN_TOP_LEVEL_INDEX as usize + 1;
+        let mut saved = KVec::with_capacity(count, GFP_KERNEL)?;
+        saved.resize(count, 0, GFP_KERNEL)?;
+        // SAFETY: The kernel root is the bootloader-reserved `pagetables` region, which outlives
+        // this `Uat`.
+        unsafe {
+            pgtable::with_root_entries(
+                self.inner.reserved.as_deref(),
+                self.kernel_vm.ttb(),
+                count,
+                |ptes| {
+                    for (value, pte) in saved.iter_mut().zip(ptes) {
+                        *value = pte.load(Ordering::Relaxed);
+                    }
+                },
+            )
+        }?;
+        let host = saved.iter().skip(owned).filter(|&&v| v != 0).count();
+        self.inner.lock().saved_roots = saved;
+        Ok(host)
+    }
+
+    /// After a cold restart, once the firmware entries are adopted again: stores back the host's
+    /// entries above them as [`Self::save_host_root_entries`] found them. Returns how many were
+    /// stored (entries that already hold the saved value are left alone).
+    pub(crate) fn restore_host_root_entries(&self) -> Result<usize> {
+        let saved = core::mem::replace(&mut self.inner.lock().saved_roots, KVec::new());
+        if saved.is_empty() {
+            return Err(ENOENT);
+        }
+        let owned = IOVA_KERN_TOP_LEVEL_INDEX as usize + 1;
+        let mut stored = 0;
+        // SAFETY: As in `save_host_root_entries`.
+        unsafe {
+            pgtable::with_root_entries(
+                self.inner.reserved.as_deref(),
+                self.kernel_vm.ttb(),
+                saved.len(),
+                |ptes| {
+                    for (pte, &value) in ptes.iter().zip(saved.iter()).skip(owned) {
+                        if pte.load(Ordering::Relaxed) != value {
+                            pte.store(value, Ordering::Relaxed);
+                            stored += 1;
+                        }
+                    }
+                },
+            )
+        }?;
+        mem::sync();
+        mem::tlbi_all();
+        mem::sync();
+        Ok(stored)
+    }
+
+    /// Snapshots the root entries up to the kernel window and clears the ones above it.
+    fn take_firmware_root_entries(&self) -> Result<[u64; 3]> {
         let owned = IOVA_KERN_TOP_LEVEL_INDEX as usize + 1;
         let mut snapshot = [0; 3];
         // SAFETY: The kernel root is the bootloader-reserved `pagetables` region, which outlives
@@ -4093,6 +4258,185 @@ impl Uat {
         Ok(())
     }
 
+    /// Rewrites the no-map handoff region and TTBAT from host state, for a firmware that the boot
+    /// loader cold-restarted while the host state was restored from a hibernation image: no-map
+    /// reserved memory is not in the image, while every root the TTBAT names (RAM) is.
+    ///
+    /// The result is the TTBAT [`Uat::new`] leaves (context 0 the kernel roots, context 1 the
+    /// kernel alias, so that `activate_render_context` can run again), plus the words of every
+    /// live execution context ([`UatShared::execution_roots`]). Call before the coprocessor
+    /// starts. Only G17 (`UatFirmware::PublishedRoots`) without VM-slot bindings is supported.
+    pub(crate) fn reset_after_cold_boot(&self) -> Result {
+        if !matches!(self.inner.firmware, UatFirmware::PublishedRoots { .. }) {
+            return Err(EINVAL);
+        }
+        let ttb0 = self.kernel_lower_vm.ttb();
+        let inner = self.inner.lock();
+        if inner.binding_published.iter().any(|&published| published) {
+            pr_err!("MMU: cold reset with published VM-slot bindings is not supported\n");
+            return Err(EINVAL);
+        }
+        let ttb1 = inner.kernel_ttb1;
+        inner.handoff().init(self.inner.firmware, inner.quirks.handoff_slot, inner.quirks.handoff_unk2)?;
+        if inner.quirks.clean_tables {
+            pgtable::clean_poc(
+                core::ptr::from_ref(inner.handoff()).cast::<u8>(),
+                HANDOFF_SIZE,
+            );
+            pgtable::poc_barrier();
+        }
+        inner.handoff_lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
+        ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
+        for ctx in &ttbs[1..] {
+            ctx.ttb0.store(0, Ordering::Relaxed);
+            ctx.ttb1.store(0, Ordering::Relaxed);
+        }
+        let alias = &ttbs[KERNEL_ALIAS_CTX];
+        alias
+            .ttb0
+            .store(tagged_root(ttb0, KERNEL_ALIAS_CTX), Ordering::SeqCst);
+        alias
+            .ttb1
+            .store(tagged_root(ttb1, KERNEL_ALIAS_CTX), Ordering::SeqCst);
+        let mut live = 0u32;
+        for (id, &(low, high)) in inner.execution_roots.iter().enumerate() {
+            if inner.execution_contexts & (1u64 << id) == 0 || (low, high) == (0, 0) {
+                continue;
+            }
+            ttbs[id].ttb0.store(low, Ordering::Release);
+            ttbs[id].ttb1.store(high, Ordering::Release);
+            live += 1;
+        }
+        if inner.quirks.clean_tables {
+            pgtable::clean_poc(ttbs.as_ptr().cast::<u8>(), SLOTS_SIZE);
+            pgtable::poc_barrier();
+        }
+        inner.handoff_unlock();
+        drop(inner);
+        mem::sync();
+        mem::tlbi_all();
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: TTBAT rewritten after cold boot ({} execution contexts)\n",
+            live
+        );
+        Ok(())
+    }
+
+    /// Marks the no-map TTBAT and table regions as not holding the host's state, or as holding
+    /// it again (see `pgtable::ReservedTables::stale`). Set when a hibernation freeze completes
+    /// (the image will not hold them), cleared by [`Self::relink_after_cold_boot`] or at a warm
+    /// thaw. While set, kernel-VM walks through reserved parents follow recorded links and
+    /// defer new tables, and execution contexts are tracked in the shadow only.
+    pub(crate) fn set_reserved_stale(&self, stale: bool) {
+        if stale {
+            let _shared = self.inner.lock();
+            self.inner.ttbat_shadowed.store(true, Ordering::Release);
+        }
+        if let Some(reserved) = self.inner.reserved.as_ref() {
+            reserved.set_stale(stale);
+        }
+    }
+
+    /// Warm thaw: the TTBAT kept the host's words, but execution contexts created or released
+    /// while the regions were marked stale changed only the shadow. Writes the shadow back for
+    /// every execution-context slot that differs, then clears the stale mark.
+    pub(crate) fn thaw_reserved_state(&self) {
+        let inner = self.inner.lock();
+        inner.handoff_lock();
+        let ttbs = inner.ttbs();
+        let mut changed = 0u64;
+        for id in 0..UAT_NUM_CTX {
+            if EXECUTION_CONTEXT_MASK & (1u64 << id) == 0 || inner.binding_published[id] {
+                continue;
+            }
+            let (low, high) = inner.execution_roots[id];
+            if ttbs[id].ttb0.load(Ordering::Acquire) != low
+                || ttbs[id].ttb1.load(Ordering::Acquire) != high
+            {
+                ttbs[id].ttb0.store(low, Ordering::Release);
+                ttbs[id].ttb1.store(high, Ordering::Release);
+                inner.publish_slot(id);
+                changed |= 1u64 << id;
+            }
+        }
+        inner.handoff_unlock();
+        // Under the same lock as the sync: a release from here on finds the host's words.
+        self.inner.ttbat_shadowed.store(false, Ordering::Release);
+        drop(inner);
+        if changed != 0 {
+            mem::sync();
+            for id in 0..UAT_NUM_CTX {
+                if changed & (1u64 << id) != 0 {
+                    mem::tlbi_asid(id as u8);
+                }
+            }
+            mem::sync();
+        }
+        // The tables were relinked before this (no-op if already clear).
+        if let Some(reserved) = self.inner.reserved.as_ref() {
+            reserved.set_stale(false);
+        }
+    }
+
+    /// A second witness, besides the coprocessor run bit, that the no-map handoff and TTBAT
+    /// still hold what this host wrote (a warm thaw): the handoff magic, both kernel roots of
+    /// context 0 and the kernel root of context 1, which nothing changes after the opening.
+    /// Execution contexts are not compared: those created or released while the state was
+    /// marked stale changed only the shadow. Any mismatch means a cold boot replaced them.
+    /// Returns the number of mismatching words.
+    pub(crate) fn reserved_state_mismatches(&self) -> usize {
+        let ttb0 = self.kernel_lower_vm.ttb();
+        let inner = self.inner.lock();
+        let ttb1 = inner.kernel_ttb1;
+        let ttbs = inner.ttbs();
+        [
+            inner.handoff().magic_ap.load(Ordering::Acquire) != PPL_MAGIC,
+            ttbs[0].ttb0.load(Ordering::Acquire) != ttb0 | TTBR_VALID,
+            ttbs[0].ttb1.load(Ordering::Acquire) != ttb1 | TTBR_VALID,
+            ttbs[KERNEL_ALIAS_CTX].ttb1.load(Ordering::Acquire)
+                != tagged_root(ttb1, KERNEL_ALIAS_CTX),
+        ]
+        .into_iter()
+        .filter(|&mismatch| mismatch)
+        .count()
+    }
+
+    /// Stores again the descriptors the kernel VM placed in the firmware's no-map kernel-window
+    /// table (see `UatPageTable::relink_reserved`). Call after the firmware booted and rebuilt
+    /// its root, as the first boot maps the graph after it; returns `(stored, recorded)`.
+    pub(crate) fn relink_after_cold_boot(&self) -> Result<(usize, usize)> {
+        // Without no-map table regions (T8142, T8140: `UatQuirks::reserved_tables` off) every
+        // kernel-VM table is host RAM held in the image: nothing was placed in firmware-owned
+        // memory, so there is nothing to store again.
+        if self.inner.reserved.is_none() {
+            return Ok((0, 0));
+        }
+        let mut inner = self.kernel_vm.gpuvm.lock_inner();
+        let recorded = inner.page_table.reserved_link_count();
+        // Store the descriptors first; walks follow the recorded links until then.
+        if let Some(reserved) = self.inner.reserved.as_ref() {
+            reserved.set_stale(false);
+        }
+        let stored = match inner.page_table.relink_reserved() {
+            Ok(stored) => stored,
+            Err(error) => {
+                if let Some(reserved) = self.inner.reserved.as_ref() {
+                    reserved.set_stale(true);
+                }
+                return Err(error);
+            }
+        };
+        drop(inner);
+        mem::sync();
+        mem::tlbi_all();
+        mem::sync();
+        Ok((stored, recorded))
+    }
+
     /// Discards the CPU's cached lines of the no-map table regions after the firmware built its
     /// root there during boot (`UatQuirks::reserved_tables`; see `ReservedTables::invalidate`).
     pub(crate) fn invalidate_reserved_tables(&self) {
@@ -4150,6 +4494,9 @@ impl Uat {
                 firmware,
                 m4_adopted: false,
                 failed: AtomicBool::new(false),
+                ttbat_shadowed: AtomicBool::new(false),
+                adopted_roots: [const { AtomicU64::new(0) }; 3],
+                roots_adopted: AtomicBool::new(false),
                 clean_poc: quirks.clean_tables,
                 quirks,
                 reserved,
@@ -4175,7 +4522,9 @@ impl Uat {
                         binding_generations: [0; UAT_NUM_CTX],
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
+                        execution_roots: [(0, 0); UAT_NUM_CTX],
                         secondary_ttb1: None,
+                        saved_roots: KVec::new(),
                         map_kernel_to_user: false,
                         handoff_rgn,
                         ttbs_rgn,

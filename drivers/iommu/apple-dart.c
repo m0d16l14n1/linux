@@ -354,8 +354,16 @@ struct apple_dart {
 
 	void __iomem *regs;
 	void __iomem *gapf;
-	/* The GAPF slice as it read at probe; a deep sleep resets it to 0 */
+	/*
+	 * The GAPF slice as the boot left it, read before the first write (U32_MAX until
+	 * then); a deep sleep resets it to 0
+	 */
 	u32 gapf_boot;
+	/*
+	 * The bit that protects the coprocessor's power state: bit 4 of a GAPF slice, or
+	 * this DART's bit in a shared PS write-disable register (T8142)
+	 */
+	u32 gapf_protect;
 	bool sleep_flushed;
 	/*
 	 * A display DART whose streams are off for a power-down: its registers may be
@@ -414,6 +422,8 @@ struct apple_dart {
 	u32 restore_on_power_up : 1;
 	/* Powered down by its DCP across a real sleep: see apple_dart_host_power_on(). */
 	u32 host_off_slept : 1;
+	/* A PCIe-C DART that loses its probe tunables with its state (T6040, T6041). */
+	u32 reapply_tunables : 1;
 	bool commands_gated;
 	/* Resume restored the translations, but the last steps of its reset failed. */
 	bool reset_incomplete;
@@ -431,6 +441,14 @@ struct apple_dart {
 	bool full_errors;
 	bool ctc_flush;
 	bool client_partitions;
+
+	/*
+	 * How long a T8110 TLB command may stay busy, in microseconds
+	 * (apple,tlb-busy-timeout-us); DART_T8110_FLUSH_BUSY_TIMEOUT if unset.
+	 * A display scanout DART can hold a ranged invalidation until the pipe
+	 * lets go of the translations it has fetched for the frame being read.
+	 */
+	u32 tlb_busy_timeout_us;
 
 	/* J713 internal display DARTs, borrowed from the running DCP. */
 	struct apple_dart_dcp *dcp;
@@ -534,6 +552,14 @@ struct apple_dart {
 	 * The first error of each stream is logged.
 	 */
 	int locked_retire_err[DART_MAX_STREAMS];
+	/* Physical address of each mapped locked root, as read from its TTBR. */
+	phys_addr_t locked_phys[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/*
+	 * Page-table configuration last published into each locked stream's
+	 * roots, for the re-import after a resume from disk (the boot loader
+	 * installs fresh firmware roots). Cleared when the stream's roots retire.
+	 */
+	struct io_pgtable_cfg *locked_cfg[DART_MAX_STREAMS];
 };
 
 #define APPLE_DART_WRITER_COUNTED	1
@@ -1463,6 +1489,7 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 		dart->locked_fw[sid][idx] = fw;
 		if (!idx)
 			dart->locked_fw_tree[sid] = tree;
+		dart->locked_phys[sid][idx] = phys;
 		spin_unlock_irqrestore(&dart->lock, flags);
 	}
 
@@ -1513,6 +1540,8 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 			tree = dart->locked_fw_tree[sid];
 			dart->locked_fw_tree[sid] = NULL;
 		}
+		dart->locked_phys[sid][idx] = 0;
+		dart->locked_cfg[sid] = NULL;
 		spin_unlock_irqrestore(&dart->lock, flags);
 		/* Once per stream: the error is never cleared. */
 		if (first)
@@ -1612,6 +1641,8 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			if (ret)
 				goto out;
 		}
+		if (dart->locked_ttbr[sid][0])
+			dart->locked_cfg[sid] = cfg;
 	}
 out:
 	spin_unlock_irqrestore(&dart->lock, flags);
@@ -1663,7 +1694,10 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 				   u32 command, bool range, u64 first, u64 last)
 {
 	struct apple_dart *dart = stream_map->dart;
+	/* Zero: a DART set up outside probe. read_poll_timeout's 0 waits for ever. */
+	u32 busy_us = dart->tlb_busy_timeout_us ?: DART_T8110_FLUSH_BUSY_TIMEOUT;
 	unsigned long flags;
+	u64 start_ns, slow_us = 0;
 	u32 status;
 	int sid, ret = 0;
 
@@ -1679,7 +1713,7 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 
 		ret = read_poll_timeout_atomic(apple_dart_readl, status,
 			!(status & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
+			busy_us, false, dart,
 			DART_T8110_TLB_CMD);
 		if (ret)
 			break;
@@ -1695,12 +1729,14 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 		}
 		dma_wmb();
 		apple_dart_writel(dart, val, DART_T8110_TLB_CMD);
+		start_ns = ktime_get_ns();
 		ret = read_poll_timeout_atomic(apple_dart_readl, status,
 			!(status & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
+			busy_us, false, dart,
 			DART_T8110_TLB_CMD);
 		if (ret)
 			break;
+		slow_us = max_t(u64, slow_us, div_u64(ktime_get_ns() - start_ns, NSEC_PER_USEC));
 	}
 	/* A V2 flush leaves the context cache alone: flush all of it after. */
 	if (!ret && dart->ctc_flush && dart->version >= 0x0202 &&
@@ -1709,8 +1745,12 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 	spin_unlock_irqrestore(&dart->lock, flags);
 	if (ret)
 		dev_err_ratelimited(dart->dev,
-			"TLB command %#x for stream %d timed out (%#x)\n",
-			command, sid, status);
+			"TLB command %#x for stream %d timed out after %u us (%#x)\n",
+			command, sid, busy_us, status);
+	else if (slow_us > DART_T8110_FLUSH_BUSY_TIMEOUT)
+		/* Would have timed out with the default wait: how long it really takes. */
+		dev_info_ratelimited(dart->dev, "TLB command %#x%s took %llu us\n",
+				     command, range ? " (range)" : "", slow_us);
 	return ret;
 }
 
@@ -5260,8 +5300,33 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->gapf = devm_platform_ioremap_resource_byname(pdev, "gapf");
 		if (IS_ERR(dart->gapf))
 			return PTR_ERR(dart->gapf);
-		dart->gapf_boot = readl(dart->gapf);
+		/* Read at its first use, a sleep's: a boot without one never touches it. */
+		dart->gapf_boot = U32_MAX;
+		dart->gapf_protect = APPLE_DART_GAPF_PROTECT;
+	} else if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "ps-wr-dis")) {
+		u32 bit;
+
+		/*
+		 * T8142: the SPTM's dart-ps-wr-dis-entries give each DART a bit in a register
+		 * of a PSWRDIS block instead of a GAPF slice. The register is shared, so
+		 * only this DART's bit is ever changed.
+		 */
+		ret = of_property_read_u32(dev->of_node, "apple,ps-wr-dis-bit", &bit);
+		if (ret || bit > 31)
+			return dev_err_probe(dev, ret ?: -EINVAL,
+					     "ps-wr-dis needs apple,ps-wr-dis-bit\n");
+		dart->gapf = devm_platform_ioremap_resource_byname(pdev, "ps-wr-dis");
+		if (IS_ERR(dart->gapf))
+			return PTR_ERR(dart->gapf);
+		dart->gapf_boot = U32_MAX;
+		dart->gapf_protect = BIT(bit);
 	}
+	dart->tlb_busy_timeout_us = DART_T8110_FLUSH_BUSY_TIMEOUT;
+	of_property_read_u32(dev->of_node, "apple,tlb-busy-timeout-us",
+			     &dart->tlb_busy_timeout_us);
+	if (!dart->tlb_busy_timeout_us || dart->tlb_busy_timeout_us > 100000)
+		return dev_err_probe(dev, -EINVAL, "apple,tlb-busy-timeout-us out of range\n");
+
 	/* T8132's ISP DART names its DAPF page but has no ranges to restore. */
 	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf") &&
 	    of_property_present(pdev->dev.of_node, "apple,dapf-ranges")) {
@@ -5346,6 +5411,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dev_dbg(dev, "applying %zu PCIe-C DART tunables\n",
 			dart->tunables->sz);
 		apple_dart_apply_tunables(dart, dart->tunables);
+		dart->reapply_tunables = of_device_is_compatible(dev->of_node,
+								 "apple,t6041-dart");
 	}
 
 	if (tunneled) {
@@ -5365,8 +5432,13 @@ static int apple_dart_probe(struct platform_device *pdev)
 			dart->oas = DART_PCIEC_ADDR_WIDTH;
 			dart->num_streams = DART_PCIEC_STREAMS;
 			dart->four_level = true;
-			/* T8132 PCIe-C DARTs keep per-stream exception records. */
-			if (of_device_is_compatible(dev->of_node, "apple,t8132-dart"))
+			/*
+			 * T8132 PCIe-C DARTs keep per-stream exception records.
+			 * T6040/T6041 carry the same PCIe-C block, and their DARTs
+			 * report version 0x0202 (PARAMS3) wherever they can be read.
+			 */
+			if (of_device_is_compatible(dev->of_node, "apple,t8132-dart") ||
+			    of_device_is_compatible(dev->of_node, "apple,t6041-dart"))
 				dart->version = 0x0202;
 		} else {
 			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
@@ -6486,6 +6558,13 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 		return ret;
 	}
 
+	/*
+	 * A T6040/T6041 PCIe-C DART that lost its state lost its tunables with it:
+	 * apply them again before the reset, in the order of probe.
+	 */
+	if (dart->reapply_tunables)
+		apple_dart_apply_tunables(dart, dart->tunables);
+
 	ret = apple_dart_hw_reset(dart);
 
 	/*
@@ -6676,8 +6755,135 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 	return pm_suspend_via_firmware() ? apple_dart_resume_noirq(dev) : 0;
 }
 
+/*
+ * Resume from disk is a cold boot: the boot loader locked every locked DART
+ * again with fresh firmware-owned roots, while the restored kernel still
+ * describes the roots of the image (their mapping, their firmware snapshot
+ * and the slots it had published). Every publication then fails (-EBUSY),
+ * and with it every DMA mapping through the DART. Re-import the live roots
+ * the way attach maps them, then publish the stream's page tables into them
+ * again, as attach does. Firmware-owned memory is never written: the old root's
+ * published slots are forgotten, not retired.
+ */
+static int apple_dart_reimport_locked(struct apple_dart *dart)
+{
+	DECLARE_BITMAP(redo, DART_MAX_STREAMS) = {};
+	unsigned int sid, idx;
+	int ret = 0, done = 0;
+
+	/*
+	 * Two passes, as attach does: every stream's live roots are re-read and
+	 * snapshotted before any of them is republished, so that a root shared
+	 * by several streams is snapshotted before Linux slots enter it.
+	 */
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		bool any = false;
+
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u64 *live = dart->locked_ttbr[sid][idx];
+			u64 *owned = dart->locked_owned[sid][idx];
+			struct apple_dart_fw_root *fw, *old_fw;
+			unsigned long flags;
+			phys_addr_t phys;
+			u64 *l1 = live;
+			u32 ttbr;
+
+			if (!live || !owned)
+				continue;
+			ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+			if (!(ttbr & dart->hw->ttbr_valid)) {
+				dev_err(dart->dev, "hibernation restore: stream %u ttbr[%u] not valid\n",
+					sid, idx);
+				ret = ret ?: -EIO;
+				continue;
+			}
+			ttbr &= ~dart->hw->ttbr_valid;
+			if (dart->hw->ttbr_addr_field_shift)
+				ttbr >>= dart->hw->ttbr_addr_field_shift;
+			phys = ((phys_addr_t)ttbr) << dart->hw->ttbr_shift;
+			if (dart->fw_handoff && !apple_dart_fw_table_ram(dart, phys)) {
+				ret = ret ?: -EINVAL;
+				continue;
+			}
+			if (phys != dart->locked_phys[sid][idx]) {
+				l1 = devm_memremap(dart->dev, phys, dart->pgsize, MEMREMAP_WB);
+				if (IS_ERR(l1)) {
+					ret = ret ?: PTR_ERR(l1);
+					continue;
+				}
+			}
+			fw = apple_dart_snapshot_fw_root(dart, sid, l1);
+			if (IS_ERR(fw)) {
+				if (l1 != live)
+					devm_memunmap(dart->dev, l1);
+				ret = ret ?: PTR_ERR(fw);
+				continue;
+			}
+			spin_lock_irqsave(&dart->lock, flags);
+			old_fw = dart->locked_fw[sid][idx];
+			memset(owned, 0, dart->pgsize);
+			dart->locked_ttbr[sid][idx] = l1;
+			dart->locked_phys[sid][idx] = phys;
+			dart->locked_fw[sid][idx] = fw;
+			spin_unlock_irqrestore(&dart->lock, flags);
+			apple_dart_free_fw_root(dart, old_fw);
+			if (l1 != live)
+				devm_memunmap(dart->dev, live);
+			any = true;
+		}
+		if (any)
+			__set_bit(sid, redo);
+	}
+
+	for_each_set_bit(sid, redo, dart->num_streams) {
+		struct apple_dart_stream_map stream = { .dart = dart };
+		struct io_pgtable_cfg *cfg = READ_ONCE(dart->locked_cfg[sid]);
+		int err;
+
+		if (!cfg)
+			continue;
+		__set_bit(sid, stream.sidmap);
+		err = apple_dart_hw_sync_locked(cfg, &stream, false);
+		if (!err)
+			err = dart->hw->invalidate_tlb(&stream);
+		if (err) {
+			dev_err(dart->dev, "hibernation restore: stream %u not republished: %d\n",
+				sid, err);
+			ret = ret ?: err;
+			continue;
+		}
+		done++;
+	}
+	dev_dbg(dart->dev, "hibernation restore: %d locked streams re-imported from the boot loader's roots, first error %d\n",
+		done, ret);
+	return ret;
+}
+
+static int apple_dart_restore(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret || !dart->locked)
+		return ret;
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+	/* Logged per stream; a failed stream must not fail the whole restore. */
+	apple_dart_reimport_locked(dart);
+	pm_runtime_put(dev);
+	return 0;
+}
+
+/* A resume from disk also re-imports the roots the boot loader locked again. */
 static const struct dev_pm_ops apple_dart_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(apple_dart_system_suspend, apple_dart_system_resume)
+	.suspend = pm_sleep_ptr(apple_dart_system_suspend),
+	.resume = pm_sleep_ptr(apple_dart_system_resume),
+	.freeze = pm_sleep_ptr(apple_dart_system_suspend),
+	.thaw = pm_sleep_ptr(apple_dart_system_resume),
+	.poweroff = pm_sleep_ptr(apple_dart_system_suspend),
+	.restore = pm_sleep_ptr(apple_dart_restore),
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend_noirq, apple_dart_sys_resume_noirq)
 	RUNTIME_PM_OPS(apple_dart_suspend, apple_dart_resume, NULL)
 };
@@ -7060,9 +7266,21 @@ out:
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_state);
 #endif
 
+/* The slice as the boot left it is the first value read, before any write. */
+static u32 apple_dart_gapf_read(struct apple_dart *dart)
+{
+	u32 val = readl(dart->gapf);
+
+	if (dart->gapf_boot == U32_MAX)
+		dart->gapf_boot = val;
+
+	return val;
+}
+
 /*
- * Bit 4 of this DART's GAPF slice makes the fabric reject writes to its coprocessor's
- * CPU power state. It's clear from the flush until the streams come back on.
+ * Bit 4 of this DART's GAPF slice (or its PS write-disable bit) makes the fabric reject
+ * writes to its coprocessor's CPU power state. It's clear from the flush until the
+ * streams come back on.
  */
 static int apple_dart_gapf_release(struct apple_dart *dart)
 {
@@ -7071,9 +7289,9 @@ static int apple_dart_gapf_release(struct apple_dart *dart)
 	if (!dart->gapf)
 		return 0;
 
-	val = readl(dart->gapf);
-	writel(val & ~APPLE_DART_GAPF_PROTECT, dart->gapf);
-	if (readl(dart->gapf) & APPLE_DART_GAPF_PROTECT) {
+	val = apple_dart_gapf_read(dart);
+	writel(val & ~dart->gapf_protect, dart->gapf);
+	if (readl(dart->gapf) & dart->gapf_protect) {
 		dev_err(dart->dev, "GAPF slice stayed protected: %#x\n", val);
 		return -EIO;
 	}
@@ -7087,11 +7305,11 @@ static void apple_dart_gapf_protect(struct apple_dart *dart)
 {
 	u32 val;
 
-	if (!dart->gapf || !dart->sleep_flushed)
+	if (!dart->gapf || !dart->sleep_flushed || dart->gapf_boot == U32_MAX)
 		return;
 
 	val = readl(dart->gapf);
-	writel(val | dart->gapf_boot | APPLE_DART_GAPF_PROTECT, dart->gapf);
+	writel(val | dart->gapf_boot | dart->gapf_protect, dart->gapf);
 	dev_dbg(dart->dev, "GAPF slice %#x -> %#x\n", val, readl(dart->gapf));
 }
 
@@ -7100,7 +7318,7 @@ int apple_dart_gapf_ready(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
-	if (!dart->gapf || !(readl(dart->gapf) & APPLE_DART_GAPF_PROTECT))
+	if (!dart->gapf || !(apple_dart_gapf_read(dart) & dart->gapf_protect))
 		return 0;
 
 	return apple_dart_gapf_release(dart);

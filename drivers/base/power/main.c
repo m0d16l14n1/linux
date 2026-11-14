@@ -1110,6 +1110,9 @@ static void async_resume(void *data, async_cookie_t cookie);
  * @state: PM transition of the system being carried out.
  * @async: If true, the device is being resumed asynchronously.
  */
+/* Device restores started in this dpm_resume(), for the hibernation breadcrumbs. */
+static atomic_t dpm_restore_seq = ATOMIC_INIT(0);
+
 static void device_resume(struct device *dev, pm_message_t state, bool async)
 {
 	pm_callback_t callback = NULL;
@@ -1119,6 +1122,16 @@ static void device_resume(struct device *dev, pm_message_t state, bool async)
 
 	TRACE_DEVICE(dev);
 	TRACE_RESUME(0);
+
+	if (state.event == PM_EVENT_RESTORE && pm_hibernate_is_restored()) {
+		const char *name = dev_name(dev);
+		u8 tag = 0;
+
+		while (*name)
+			tag = tag * 31 + *name++;
+		pm_hibernate_note(PM_HIB_NOTE_DEVICE,
+				  (u16)atomic_inc_return(&dpm_restore_seq), tag, false);
+	}
 
 	if (dev->power.syscore)
 		goto Complete;
@@ -1232,6 +1245,7 @@ void dpm_resume(pm_message_t state)
 
 	pm_transition = state;
 	async_error = 0;
+	atomic_set(&dpm_restore_seq, 0);
 
 	mutex_lock(&dpm_list_mtx);
 

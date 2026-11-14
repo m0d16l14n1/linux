@@ -16,6 +16,7 @@ mod events;
 mod feed;
 mod render;
 pub(super) mod teardown;
+pub(super) mod traversal;
 
 pub(super) use super::now_ns;
 use super::{
@@ -772,7 +773,7 @@ impl Backend {
         // sleeping, and nothing of the new queue is visible yet.
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
-        let (lease, uat, pool, qos, execution, slot) = loop {
+        let (lease, uat, pool, qos, execution, slot, share) = loop {
             let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
@@ -795,16 +796,20 @@ impl Backend {
             }
             // The new context may reuse a pooled scheduler page: clear released QoS rows first.
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
-            let attempt = if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
+            // G17P queues of one VM join its live execution context (super::exec_share).
+            let joined = if firmware.uat.is_m5() { None } else { super::exec_share::join(vm) };
+            let attempt = if let Some((execution, share)) = joined {
+                Ok((execution, admission.reserve_queue()?, Some(share)))
+            } else if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
                 // Creators hold the device mutex, so neither check above can
                 // have changed; the slot only fails on a broken invariant.
                 let slot = admission.reserve_queue()?;
-                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot))
+                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot, None))
             } else {
                 Err(ENOSPC)
             };
             match attempt {
-                Ok((execution, slot)) => {
+                Ok((execution, slot, share)) => {
                     break (
                         lease,
                         firmware.uat.clone(),
@@ -812,6 +817,7 @@ impl Backend {
                         firmware.queues.qos_ids.clone(),
                         execution,
                         slot,
+                        share,
                     )
                 }
                 Err(error) if error == ENOSPC => {
@@ -844,6 +850,11 @@ impl Backend {
         };
         let owner_pid =
             u32::try_from(kernel::current!().group_leader().pid()).map_err(|_| EOVERFLOW)?;
+        let share = match share {
+            Some(share) => Some(share),
+            None if !uat.is_m5() => Some(super::exec_share::offer(vm, &execution)?),
+            None => None,
+        };
         let context = Arc::new(
             Context::new(
                 &alloc,
@@ -854,6 +865,7 @@ impl Backend {
                 policy,
                 shared.renders.clone(),
                 shared.progress.clone(),
+                share,
             )?,
             GFP_KERNEL,
         )?;
@@ -1292,6 +1304,7 @@ impl Backend {
                     self.shared.m5_board,
                     self.shared.variant.compute,
                     alloc.uat.is_m5(),
+                    self.shared.variant.mcache,
                 )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
@@ -1654,7 +1667,8 @@ impl super::Firmware {
         let mut native: KVec<super::sync_input::NativeWait> =
             KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
         // M5 shared-ring queues have no completion-wait records: the consumer's kick entry names
-        // the source's kick, and the firmware orders it.
+        // the source's kick, and the firmware orders it. So is a G17P source of the consumer's
+        // own execution context: one context needs no write-back between the two kicks.
         let m5 = self.init.is_m5();
         let mut waited: u128 = 0;
         for source in &sources.sources {
@@ -1662,15 +1676,15 @@ impl super::Firmware {
             let found = self.queues.compute.iter_mut().flatten()
                 .filter_map(|entry| entry.queue.as_deref_mut())
                 .find_map(|mut queue| match queue.source_dependency(source, packet.completion.status(),
-                    self.recovery.generation()) {
+                    self.recovery.generation(), &packet.context) {
                     Ok(None) => None,
                     result => Some(result),
                 }).ok_or(EAGAIN)??;
-            let Some((sequence, dependency, stamp_va, event_slot, hold)) = found else {
+            let Some((sequence, dependency, stamp_va, event_slot, hold, same_execution)) = found else {
                 return Err(EAGAIN);
             };
             waited |= 1u128 << dependency.qid();
-            if m5 {
+            if m5 || same_execution {
                 merged.insert(sequence, dependency)?;
                 holds.push(hold, GFP_KERNEL)?;
                 continue;
@@ -2143,16 +2157,25 @@ impl Backend {
         // The steady state: this owner's channel is bound and installed.
         if packet.completion.sources().is_none() {
             if let Some(cell) = self.direct.lock().clone() {
-                let bound = cell.lock().is_some_and(|mut queue| {
-                    let bound = queue.installed()
-                        && !queue.spared_pending()
-                        && queue.pool_fits(required)
-                        && matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true));
-                    if bound {
-                        queue.claim();
-                    }
-                    bound
-                });
+                // A claim is queue state that a hibernation freeze and the cold reset after
+                // the resume both require to be absent: it is taken only through the
+                // preparation gate, which they close and join.
+                let bound = match self.shared.preparations.admit_claim(|| {
+                    cell.lock().is_some_and(|mut queue| {
+                        let bound = queue.installed()
+                            && !queue.spared_pending()
+                            && queue.pool_fits(required)
+                            && matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true));
+                        if bound {
+                            queue.claim();
+                        }
+                        bound
+                    })
+                }) {
+                    Ok(bound) => bound,
+                    Err(error) if error == EAGAIN => return Readiness::Progress,
+                    Err(_) => return Readiness::Ready,
+                };
                 if bound {
                     self.hold_claim(Some(cell));
                     if !self.context.is_m5() {
@@ -2231,6 +2254,10 @@ impl Backend {
     /// wait leaves the command, unpublished, to its scheduler.
     pub(super) fn try_compute_early(&self, packet: &Arc<super::job::Packet>) -> bool {
         if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+            return false;
+        }
+        // A command the ray-traversal rule could hold now is left to its scheduler.
+        if !self.traversal_inline(packet) {
             return false;
         }
         if !packet.begin_publication() {
@@ -2576,6 +2603,203 @@ impl super::Firmware {
         self.queues
             .admission
             .release_retained_owners_after_processor_stop();
+    }
+}
+
+/// What still keeps the GPU from a hibernation freeze, as a bit set for the log.
+pub(super) mod busy {
+    pub(in crate::g17) const RECOVERY: u32 = 1 << 0;
+    pub(in crate::g17) const COMPUTE: u32 = 1 << 1;
+    pub(in crate::g17) const RENDER: u32 = 1 << 2;
+    pub(in crate::g17) const CONTROL: u32 = 1 << 3;
+    pub(in crate::g17) const TEARDOWN: u32 = 1 << 4;
+    pub(in crate::g17) const REPLAY: u32 = 1 << 5;
+    pub(in crate::g17) const GROW: u32 = 1 << 6;
+    pub(in crate::g17) const EXIT: u32 = 1 << 7;
+    pub(in crate::g17) const BUILDING: u32 = 1 << 8;
+    /// A queue a cold-restarted firmware could not take over as a first install.
+    pub(in crate::g17) const STATE: u32 = 1 << 9;
+}
+
+impl super::Firmware {
+    /// Everything a hibernation freeze waits for, as [`busy`] bits; zero when the GPU runs no
+    /// command and the firmware owes the host nothing: no recovery, no in-flight or retiring
+    /// command, no device-control record it has not consumed, no scheduler-release or
+    /// free-list-release witness, kill, replay or parameter-buffer growth outstanding.
+    /// A cold-restarted firmware would never answer any of those.
+    pub(super) fn busy(&self, now: u64) -> Result<u32> {
+        let mut busy = 0;
+        if self.recovery.pending() {
+            busy |= busy::RECOVERY;
+        }
+        if self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(
+            |queue| {
+                queue.in_flight()
+                    || queue.retirement_polling()
+                    || queue.pool_release_pending()
+            },
+        ) {
+            busy |= busy::COMPUTE;
+        }
+        if self.queues.render_in_flight() {
+            busy |= busy::RENDER;
+        }
+        let [consumer, _, producer] = self.init.control_counters()?;
+        if consumer != producer || self.render_control_backpressured() {
+            busy |= busy::CONTROL;
+        }
+        if !self.queues.teardown.is_empty() {
+            busy |= busy::TEARDOWN;
+        }
+        if self.queues.replay_outer_wait.is_some() || self.queues.render.replay_polling() {
+            busy |= busy::REPLAY;
+        }
+        if self.render_grow_pending() {
+            busy |= busy::GROW;
+        }
+        if self.compute_exit_polling(now) {
+            busy |= busy::EXIT;
+        }
+        if self.queues.compute_building || self.queues.compute_scheduler_building {
+            busy |= busy::BUILDING;
+        }
+        let compute_ready = self.queues.compute.iter().flatten().all(|entry| {
+            entry
+                .queue
+                .as_deref()
+                .is_some_and(|queue| queue.owner().is_none() || queue.cold_resettable())
+        });
+        if !compute_ready || !self.queues.render_cold_ready() {
+            busy |= busy::STATE;
+        }
+        Ok(busy)
+    }
+
+    pub(super) fn quiescent(&self, now: u64) -> Result<bool> {
+        Ok(self.busy(now)? == 0)
+    }
+
+    pub(super) fn log_busy(&self, dev: &kernel::device::Device) {
+        match self.busy(super::now_ns()) {
+            Ok(bits) => {
+                dev_warn!(dev, "GPU busy at hibernation freeze: {:#x}\n", bits);
+                if bits & busy::STATE != 0 {
+                    for entry in self.queues.compute.iter().flatten() {
+                        let Some(queue) = entry.queue.as_deref() else {
+                            continue;
+                        };
+                        if queue.owner().is_some() && !queue.cold_resettable() {
+                            dev_warn!(
+                                dev,
+                                "hibernation blocker: compute qid {} conditions {:#x}\n",
+                                queue.qid(),
+                                queue.cold_blockers()
+                            );
+                        }
+                    }
+                    self.queues.log_render_cold_blockers(dev);
+                }
+            }
+            Err(error) => dev_warn!(dev, "GPU busy state unreadable: {:?}\n", error),
+        }
+    }
+}
+
+/// Compute queues a cold-restarted firmware never knew, taken out of the registry by
+/// [`Registry::reset_compute_after_cold_boot`]; dropped without the device mutex, then their
+/// reservations are cancelled as an uninstalled queue's are.
+pub(super) struct RetiredCompute {
+    queues: KVec<(ComputeReservation, KBox<compute::Queue>)>,
+    /// Never-published previous bindings of queues that were reset in place.
+    previous: KVec<compute::RetiredPrevious>,
+}
+
+impl RetiredCompute {
+    pub(super) fn new() -> Self {
+        Self { queues: KVec::new(), previous: KVec::new() }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.queues.len()
+    }
+
+    /// Called without the device mutex.
+    pub(super) fn finish(self, shared: &super::Shared) -> Result {
+        drop(self.previous);
+        let mut reservations = KVec::with_capacity(self.queues.len(), GFP_KERNEL)?;
+        for (reservation, queue) in self.queues {
+            drop(queue);
+            reservations.push(reservation, GFP_KERNEL)?;
+        }
+        if reservations.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut state = shared.state.lock();
+            let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+            for reservation in reservations {
+                firmware.queues.cancel_compute(reservation)?;
+            }
+        }
+        shared.channels.notify();
+        Ok(())
+    }
+}
+
+impl Registry {
+    /// Returns every physical compute queue to a state a cold-restarted firmware can take
+    /// over, after the graph was restored and before any compute publication.
+    ///
+    /// A queue bound to a live owner becomes a fresh, uninstalled queue in place (see
+    /// `compute::Queue::reset_after_cold_boot`): its context pages and page-pool descriptor
+    /// row are rewritten and its QID is unpublished, so the owner's next command installs it.
+    /// A retained queue without an owner names nothing a client still uses; the firmware never
+    /// knew it, so it moves to `retired`, which the caller drops without the device mutex
+    /// before cancelling each reservation ([`Self::cancel_compute`]). The completion scan
+    /// restarts at slot 0 of the restored completion ring.
+    pub(super) fn reset_compute_after_cold_boot(
+        &mut self,
+        init: &super::initdata::InitData,
+        retired: &mut RetiredCompute,
+    ) -> Result<usize> {
+        if self.compute_building || self.compute_scheduler_building {
+            return Err(EBUSY);
+        }
+        self.completion_cursor = 0;
+        for seen in self.completion_seen.iter_mut() {
+            *seen = 0;
+        }
+        self.observations.clear();
+        self.replay_outer_wait = None;
+        let mut reset = 0;
+        for slot in 0..self.compute.len() {
+            let Some(entry) = self.compute[slot].as_mut() else {
+                continue;
+            };
+            let id = entry.reservation.id;
+            let owned = match entry.queue.as_deref() {
+                Some(queue) => queue.owner().is_some(),
+                // A reservation whose graph is being built: the drained gate excludes it.
+                None => return Err(EBUSY),
+            };
+            if !owned {
+                self.qids.unpublish(id)?;
+                let queue = entry.queue.take().ok_or(EIO)?;
+                retired.queues.push((entry.reservation, queue), GFP_KERNEL)?;
+                continue;
+            }
+            let mut queue = entry.queue.as_deref_mut().ok_or(EIO)?;
+            let (descriptor, previous) = queue.reset_after_cold_boot()?;
+            if let Some(previous) = previous {
+                retired.previous.push(previous, GFP_KERNEL)?;
+            }
+            queue.context().ok_or(EIO)?.reset_after_cold_boot()?;
+            init.install_compute_pool(descriptor)?;
+            drop(queue);
+            self.qids.unpublish(id)?;
+            reset += 1;
+        }
+        Ok(reset)
     }
 }
 

@@ -100,6 +100,15 @@
 &disp0_dart {
 	reg = <2 0x86300000 0 0xc000>;
 	apple,dma-range = <0x100 0x0 0x10 0x0>;
+	/*
+	 * The scanout DART holds a ranged invalidation of stream 0 while the
+	 * pipe reads the frame: on J815 (boots 087491fd..09454ec2, at every
+	 * KWin start and unlock) the 2 ms default ran out with the command
+	 * still busy (0x8600e100: FLUSH_SID, V2|RANGE|STT) and KWin's
+	 * framebuffer import failed, yet the next commands went through
+	 * ~80 ms later. Two 60 Hz frames.
+	 */
+	apple,tlb-busy-timeout-us = <34000>;
 };
 
 &dcp_dart {
