@@ -2027,6 +2027,8 @@ struct UatShared {
     execution_roots: [(u64, u64); UAT_NUM_CTX],
     /// Kernel root of the secondary firmware instance, if there is one.
     secondary_ttb1: Option<PhysicalAddr>,
+    /// The kernel root's entries saved at a hibernation freeze ([`Uat::save_host_root_entries`]).
+    saved_roots: KVec<u64>,
     map_kernel_to_user: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
@@ -2136,6 +2138,13 @@ struct UatInner {
     /// after the TTBAT was written from the shadow, separately from the table flag, which the
     /// relink clears earlier.
     ttbat_shadowed: AtomicBool,
+    /// The kernel root's top-level entries up to the kernel window as the first firmware
+    /// boot published them ([`Uat::adopt_firmware_root_entries`]); a firmware cold-restarted
+    /// after a hibernation must publish the same ones ([`Uat::readopt_firmware_root_entries`]).
+    /// Written once, before anything else reads them.
+    adopted_roots: [AtomicU64; 3],
+    /// Whether [`Self::adopted_roots`] holds a first-boot snapshot.
+    roots_adopted: AtomicBool,
     /// Clean page tables to the point of coherency for a walker that does not snoop the CPU
     /// caches: [`Uat::new_adopted`], and [`UatQuirks::clean_tables`] otherwise.
     clean_poc: bool,
@@ -3583,6 +3592,8 @@ impl Uat {
                 m4_adopted: !map_kernel_to_user,
                 failed: AtomicBool::new(false),
                 ttbat_shadowed: AtomicBool::new(false),
+                adopted_roots: [const { AtomicU64::new(0) }; 3],
+                roots_adopted: AtomicBool::new(false),
                 // The G15 UAT walker does not snoop the CPU caches.
                 clean_poc: true,
                 reserved: None,
@@ -3605,6 +3616,7 @@ impl Uat {
                         owned_user_roots: [0; UAT_NUM_CTX],
                         execution_roots: [(0, 0); UAT_NUM_CTX],
                         secondary_ttb1: None,
+                        saved_roots: KVec::new(),
                         map_kernel_to_user,
                         handoff_rgn,
                         ttbs_rgn,
@@ -4059,6 +4071,113 @@ impl Uat {
     /// cleared. Must run after the primary instance booted and before anything is mapped into the
     /// kernel `Vm`.
     pub(crate) fn adopt_firmware_root_entries(&self) -> Result<[u64; 3]> {
+        let snapshot = self.take_firmware_root_entries()?;
+        for (kept, value) in self.inner.adopted_roots.iter().zip(snapshot) {
+            kept.store(value, Ordering::Relaxed);
+        }
+        self.inner.roots_adopted.store(true, Ordering::Release);
+        Ok(snapshot)
+    }
+
+    /// Whether a first boot adopted the firmware's root entries, so that a cold restart can
+    /// check them again ([`Self::readopt_firmware_root_entries`]).
+    pub(crate) fn firmware_roots_adopted(&self) -> bool {
+        self.inner.roots_adopted.load(Ordering::Acquire)
+    }
+
+    /// [`Self::adopt_firmware_root_entries`] for a firmware cold-restarted after a hibernation
+    /// restore: the no-map root is not in the image, and the firmware rebuilt it as it booted.
+    /// The entries up to the kernel window must be the ones the first boot adopted (the kernel
+    /// window entry names the same bootloader-reserved table, under which the restored kernel
+    /// VM's recorded links are stored again), and the entries above it are cleared again.
+    /// `EIO` with the differing words logged otherwise: every host mapping beneath them would
+    /// be unreachable.
+    pub(crate) fn readopt_firmware_root_entries(&self) -> Result<[u64; 3]> {
+        if !self.firmware_roots_adopted() {
+            return Err(EINVAL);
+        }
+        let expected: [u64; 3] =
+            core::array::from_fn(|index| self.inner.adopted_roots[index].load(Ordering::Relaxed));
+        let current = self.take_firmware_root_entries()?;
+        if current != expected {
+            // The boot loader staged the firmware anew for this boot; its own top-level tables
+            // are what it walks now, so they are what the host keeps (and confirms later).
+            dev_warn!(
+                self.dev.as_ref(),
+                "MMU: cold-restarted firmware published root entries {:#x?}, first boot {:#x?}: adopting the new ones\n",
+                current,
+                expected
+            );
+            for (kept, value) in self.inner.adopted_roots.iter().zip(current) {
+                kept.store(value, Ordering::Relaxed);
+            }
+        }
+        Ok(current)
+    }
+
+    /// At a hibernation freeze: copies every entry of the kernel root. The root is the boot
+    /// loader's reserved `pagetables` page, which no image holds, so after the cold boot that
+    /// restores the image it holds only the firmware's entries: the host's kernel-window tables
+    /// above them (RAM, in the image) are unlinked until [`Self::restore_host_root_entries`].
+    /// Returns the number of host entries saved.
+    pub(crate) fn save_host_root_entries(&self) -> Result<usize> {
+        let count = UAT_PGSZ / size_of::<u64>();
+        let owned = IOVA_KERN_TOP_LEVEL_INDEX as usize + 1;
+        let mut saved = KVec::with_capacity(count, GFP_KERNEL)?;
+        saved.resize(count, 0, GFP_KERNEL)?;
+        // SAFETY: The kernel root is the bootloader-reserved `pagetables` region, which outlives
+        // this `Uat`.
+        unsafe {
+            pgtable::with_root_entries(
+                self.inner.reserved.as_deref(),
+                self.kernel_vm.ttb(),
+                count,
+                |ptes| {
+                    for (value, pte) in saved.iter_mut().zip(ptes) {
+                        *value = pte.load(Ordering::Relaxed);
+                    }
+                },
+            )
+        }?;
+        let host = saved.iter().skip(owned).filter(|&&v| v != 0).count();
+        self.inner.lock().saved_roots = saved;
+        Ok(host)
+    }
+
+    /// After a cold restart, once the firmware entries are adopted again: stores back the host's
+    /// entries above them as [`Self::save_host_root_entries`] found them. Returns how many were
+    /// stored (entries that already hold the saved value are left alone).
+    pub(crate) fn restore_host_root_entries(&self) -> Result<usize> {
+        let saved = core::mem::replace(&mut self.inner.lock().saved_roots, KVec::new());
+        if saved.is_empty() {
+            return Err(ENOENT);
+        }
+        let owned = IOVA_KERN_TOP_LEVEL_INDEX as usize + 1;
+        let mut stored = 0;
+        // SAFETY: As in `save_host_root_entries`.
+        unsafe {
+            pgtable::with_root_entries(
+                self.inner.reserved.as_deref(),
+                self.kernel_vm.ttb(),
+                saved.len(),
+                |ptes| {
+                    for (pte, &value) in ptes.iter().zip(saved.iter()).skip(owned) {
+                        if pte.load(Ordering::Relaxed) != value {
+                            pte.store(value, Ordering::Relaxed);
+                            stored += 1;
+                        }
+                    }
+                },
+            )
+        }?;
+        mem::sync();
+        mem::tlbi_all();
+        mem::sync();
+        Ok(stored)
+    }
+
+    /// Snapshots the root entries up to the kernel window and clears the ones above it.
+    fn take_firmware_root_entries(&self) -> Result<[u64; 3]> {
         let owned = IOVA_KERN_TOP_LEVEL_INDEX as usize + 1;
         let mut snapshot = [0; 3];
         // SAFETY: The kernel root is the bootloader-reserved `pagetables` region, which outlives
@@ -4290,6 +4409,12 @@ impl Uat {
     /// table (see `UatPageTable::relink_reserved`). Call after the firmware booted and rebuilt
     /// its root, as the first boot maps the graph after it; returns `(stored, recorded)`.
     pub(crate) fn relink_after_cold_boot(&self) -> Result<(usize, usize)> {
+        // Without no-map table regions (T8142, T8140: `UatQuirks::reserved_tables` off) every
+        // kernel-VM table is host RAM held in the image: nothing was placed in firmware-owned
+        // memory, so there is nothing to store again.
+        if self.inner.reserved.is_none() {
+            return Ok((0, 0));
+        }
         let mut inner = self.kernel_vm.gpuvm.lock_inner();
         let recorded = inner.page_table.reserved_link_count();
         // Store the descriptors first; walks follow the recorded links until then.
@@ -4370,6 +4495,8 @@ impl Uat {
                 m4_adopted: false,
                 failed: AtomicBool::new(false),
                 ttbat_shadowed: AtomicBool::new(false),
+                adopted_roots: [const { AtomicU64::new(0) }; 3],
+                roots_adopted: AtomicBool::new(false),
                 clean_poc: quirks.clean_tables,
                 quirks,
                 reserved,
@@ -4397,6 +4524,7 @@ impl Uat {
                         owned_user_roots: [0; UAT_NUM_CTX],
                         execution_roots: [(0, 0); UAT_NUM_CTX],
                         secondary_ttb1: None,
+                        saved_roots: KVec::new(),
                         map_kernel_to_user: false,
                         handoff_rgn,
                         ttbs_rgn,

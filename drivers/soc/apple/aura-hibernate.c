@@ -426,9 +426,17 @@ static void aura_hibernate_reprobe_work(struct work_struct *work)
 	struct aura_hibernate_reprobe *rp = container_of(work, struct aura_hibernate_reprobe, work);
 	int ret;
 
+	static atomic_t n = ATOMIC_INIT(0);
+	u16 seq = atomic_inc_return(&n) & 0x7fff;
+
+	dev_info(rp->dev, "resume from disk: probing again (re-probe %u)\n", seq);
+	pm_hibernate_note_dev(PM_HIB_NOTE_REPROBE, seq, rp->dev);
 	ret = device_reprobe(rp->dev);
 	/* A failed probe is not reported by device_reprobe() itself. */
-	if (ret || !READ_ONCE(rp->dev->driver))
+	if (!ret && !READ_ONCE(rp->dev->driver))
+		ret = -ENODEV;
+	pm_hibernate_note_dev(PM_HIB_NOTE_REPROBE_DONE, seq | (ret ? 0x8000 : 0), rp->dev);
+	if (ret)
 		dev_err(rp->dev, "probe after the resume from disk failed: %d\n", ret);
 	put_device(rp->dev);
 	kfree(rp);

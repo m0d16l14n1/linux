@@ -2789,12 +2789,12 @@ impl Registry {
                 continue;
             }
             let mut queue = entry.queue.as_deref_mut().ok_or(EIO)?;
-            let ((pool, page_list, blocks), previous) = queue.reset_after_cold_boot()?;
+            let (descriptor, previous) = queue.reset_after_cold_boot()?;
             if let Some(previous) = previous {
                 retired.previous.push(previous, GFP_KERNEL)?;
             }
             queue.context().ok_or(EIO)?.reset_after_cold_boot()?;
-            init.install_compute_pool(super::freelist::PoolDescriptor::Neo { slot: pool, page_list, blocks })?;
+            init.install_compute_pool(descriptor)?;
             drop(queue);
             self.qids.unpublish(id)?;
             reset += 1;

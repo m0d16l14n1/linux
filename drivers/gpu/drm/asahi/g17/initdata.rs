@@ -361,7 +361,7 @@ impl InitData {
     /// Keeps the post-build contents of the graph (see [`Pristine`]). Called at the end of a
     /// successful build, while the host is still the graph's only user. Best effort: without
     /// the copy only hibernation is refused ([`Self::has_pristine`]), never the probe.
-    fn capture_pristine(&mut self, dev: &AsahiDrmDevice) {
+    pub(super) fn capture_pristine(&mut self, dev: &AsahiDrmDevice) {
         let started = super::now_ns();
         match self.copy_out_pristine() {
             Ok(pristine) => {
@@ -458,6 +458,10 @@ impl InitData {
         self.compute_active.set(false);
         for checked in &self.event_ring_checked {
             checked.set((0, 0, 0));
+        }
+        // M5: the shared outer rings' cursors are back at build values with the graph.
+        if let Some(credits) = self.outer_credits.as_ref() {
+            credits.reset_after_cold_boot()?;
         }
         Ok(())
     }

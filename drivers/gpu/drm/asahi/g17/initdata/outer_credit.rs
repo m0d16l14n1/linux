@@ -51,6 +51,23 @@ impl Credits {
 
     pub(super) fn available(&self) -> Arc<Availability> { self.available.clone() }
 
+    /// For a firmware cold-restarted after a hibernation restore, once the shared rings are
+    /// back at their post-build cursors: the consumers last seen are the previous instance's,
+    /// so progress starts over from the next sample. `published` counts only deltas within a
+    /// scope and stays. The rings were drained at the freeze: an outstanding claim or scope
+    /// is `EBUSY`.
+    pub(super) fn reset_after_cold_boot(&self) -> Result {
+        if self.scoped.load(Ordering::Acquire)
+            || self.reserved.iter().any(|reserved| reserved.load(Ordering::Acquire) != 0)
+        {
+            return Err(EBUSY);
+        }
+        for consumer in &self.consumers {
+            consumer.store(u64::MAX, Ordering::Release);
+        }
+        Ok(())
+    }
+
     pub(super) fn waiting(&self) -> bool { self.available.has_waiters() }
 
     pub(super) fn capacity(&self, priority: u8, cursors: [u32; 3]) -> Result<u32> {

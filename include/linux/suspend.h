@@ -481,6 +481,61 @@ static inline bool pm_hibernate_is_loading(void) { return false; }
 static inline int pm_hibernate_restored_cold(void) { return 0; }
 #endif
 
+/*
+ * Hibernation restore breadcrumbs, for a platform whose RAM does not survive the reset that
+ * ends a hung restore (Apple T8142: PMU scratch). @raw: the caller runs where nothing else
+ * talks to the platform's buses (IRQs off, devices at most noirq-resumed); otherwise it may
+ * sleep. @seq/@tag: the device restore counter and a hash of the device name, else 0.
+ */
+#define PM_HIB_NOTE_IMAGE_READ		0x01	/* loading kernel: image in memory */
+#define PM_HIB_NOTE_QUIESCED		0x02	/* loading kernel: devices quiesced (raw) */
+#define PM_HIB_NOTE_JUMP		0x03	/* loading kernel: entering the image (raw) */
+#define PM_HIB_NOTE_RESTORED		0x10	/* restored kernel running, IRQs off (raw) */
+#define PM_HIB_NOTE_CPUS_BACK		0x11	/* syscore + CPUs back, noirq/early restore next (raw) */
+#define PM_HIB_NOTE_EARLY_DONE		0x12	/* noirq + early restore done */
+#define PM_HIB_NOTE_DEVICE		0x13	/* restoring device @seq (@tag = name hash) */
+#define PM_HIB_NOTE_DEVICES_DONE	0x14	/* every device restored */
+#define PM_HIB_NOTE_COMPLETE_DONE	0x15	/* .complete done */
+#define PM_HIB_NOTE_NOTIFIERS		0x16	/* PM_POST_HIBERNATION notifiers next */
+#define PM_HIB_NOTE_NOTIFIERS_DONE	0x17	/* notifiers done */
+#define PM_HIB_NOTE_EXIT		0x1f	/* hibernation exit */
+#define PM_HIB_NOTE_ALIVE		0x20	/* heartbeat: @seq = user step << 8 | s/2, @tag = health */
+#define PM_HIB_NOTE_REPROBE		0x21	/* re-probing a device after the thaw (@tag = name hash) */
+#define PM_HIB_NOTE_REPROBE_DONE	0x22	/* that re-probe returned (@seq bit 15 = failed) */
+#define PM_HIB_NOTE_USER_STEP		0x23	/* userspace step set: @seq = step << 8 | beats */
+
+/* What the restored kernel's drivers report after a resume from disk (the heartbeat's tag). */
+#define PM_HIB_HEALTH_NVME_ADOPTED	BIT(0)	/* NVMe adopted the boot loader's ANS session */
+#define PM_HIB_HEALTH_NVME_LIVE		BIT(1)	/* NVMe controller live again */
+#define PM_HIB_HEALTH_NVME_TIMEOUT	BIT(2)	/* an NVMe request timed out */
+#define PM_HIB_HEALTH_NVME_FAILED	BIT(3)	/* NVMe quarantined / restore failed */
+#define PM_HIB_HEALTH_GPU_OK		BIT(4)	/* GPU firmware republished */
+#define PM_HIB_HEALTH_GPU_LOST		BIT(5)	/* GPU lost at the thaw */
+#define PM_HIB_HEALTH_DCP_LEFT		BIT(6)	/* display left to the boot loader */
+#define PM_HIB_HEALTH_SMC_OK		BIT(7)	/* SMC session restarted */
+#ifdef CONFIG_HIBERNATION
+void pm_hibernate_health(u8 bits);
+u8 pm_hibernate_health_get(void);
+#else
+static inline void pm_hibernate_health(u8 bits) {}
+static inline u8 pm_hibernate_health_get(void) { return 0; }
+#endif
+#ifdef CONFIG_HIBERNATION
+extern void (*pm_hibernate_note_hook)(u8 step, u16 seq, u8 tag, bool raw);
+static inline void pm_hibernate_note(u8 step, u16 seq, u8 tag, bool raw)
+{
+	void (*hook)(u8, u16, u8, bool) = READ_ONCE(pm_hibernate_note_hook);
+
+	if (hook)
+		hook(step, seq, tag, raw);
+}
+/* A note for @dev (its name hashed as in the device restore notes). */
+void pm_hibernate_note_dev(u8 step, u16 seq, struct device *dev);
+#else
+static inline void pm_hibernate_note(u8 step, u16 seq, u8 tag, bool raw) {}
+static inline void pm_hibernate_note_dev(u8 step, u16 seq, struct device *dev) {}
+#endif
+
 int arch_resume_nosmt(void);
 
 #ifdef CONFIG_HIBERNATION_SNAPSHOT_DEV

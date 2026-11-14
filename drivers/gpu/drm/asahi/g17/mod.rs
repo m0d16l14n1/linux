@@ -1140,9 +1140,13 @@ impl Firmware {
         retired: &mut runtime::RetiredCompute,
         reclaim: &mut runtime::teardown::ReclaimBatch,
     ) -> Result {
-        // A firmware root whose entries the host adopts and confirms around the build
-        // (A18 Pro) would need that step replayed; only the M4 Pro path is implemented.
-        if self.cfg.adopt_root_entries {
+        // M5 boots in its own order with its own opening (Gpu::boot_m5).
+        if self.cfg.profile.is_m5() {
+            return self.republish_m5_after_cold_boot(dev, shared, retired, reclaim);
+        }
+        // A firmware root whose entries the host adopts around the build is checked against
+        // the first boot's adoption after the restart below; without one, nothing to check.
+        if self.cfg.adopt_root_entries && !self.uat.firmware_roots_adopted() {
             return Err(EINVAL);
         }
         let pristine = self.init.pristine_size();
@@ -1156,11 +1160,55 @@ impl Firmware {
         if self.cfg.fabric_bridge {
             republish_step(dev, "fabric bridge", self.bridge.regs.enable_g17_bridge())?;
         }
-        // (2c) The PMP was cold-restarted with the GPU and starts about two seconds
-        // after its restore; its report region is reset when it starts, so the GPU's pmp-gfx
-        // power request is handed again only once it runs (pmp-report). Do not let the
-        // firmware ask for core power before then. Bounded: a PMP that never comes back
-        // leaves the GPU in the state the first-boot path would have had without it.
+        // (2c) The cold-restarted PMP (see `wait_pmp_after_cold_boot`).
+        Self::wait_pmp_after_cold_boot(dev);
+        // (3) Start the CPU: RTKit boot handshake; the firmware rebuilds its own root and
+        // kernel-window tables.
+        republish_step(dev, "coprocessor start", self.restart_coprocessors())?;
+        // (3b) As the first boot adopted the entries the firmware published before building:
+        // the same ones again, those above the kernel window cleared.
+        let adopted = match self.cfg.adopt_root_entries {
+            true => {
+                let adopted = self.uat.readopt_firmware_root_entries()?;
+                let stored = self.uat.restore_host_root_entries()?;
+                dev_info!(dev.as_ref(), "GPU republish: {} host root entries stored again\n", stored);
+                Some(adopted)
+            }
+            false => None,
+        };
+        // (4) As `init.build` mapped the graph after the firmware booted: store again the
+        // kernel-window descriptors the host placed in the firmware's no-map table.
+        let (relinked, links) =
+            republish_step(dev, "kernel-window relink", self.uat.relink_after_cold_boot())?;
+        // Contexts released since the TTBAT rewrite changed only the shadow.
+        self.uat.thaw_reserved_state();
+        if let Some(adopted) = adopted {
+            self.uat.confirm_firmware_root_entries(adopted)?;
+        }
+        // (5) Opening handshake on the restored root.
+        republish_step(dev, "opening handshake", self.open_firmware(dev, shared))?;
+        // (6) Live queues become fresh installs.
+        let (compute, render, settled) = self.reregister_live_work(dev, retired, reclaim)?;
+        dev_info!(
+            dev.as_ref(),
+            "GPU republish: graph {} KiB restored, {}/{} kernel-window links stored, {} compute queues and {} render pairs reset, {} idle compute queues retired, {} closed contexts settled\n",
+            pristine / 1024,
+            relinked,
+            links,
+            compute,
+            render,
+            retired.len(),
+            settled
+        );
+        Ok(())
+    }
+
+    /// The PMP was cold-restarted with the GPU and starts about two seconds after its restore;
+    /// its report region is reset when it starts, so the GPU's pmp-gfx power request is handed
+    /// again only once it runs (pmp-report). The firmware must not ask for core power before
+    /// then. Bounded: a PMP that never comes back leaves the GPU in the state the first-boot
+    /// path would have had without it.
+    fn wait_pmp_after_cold_boot(dev: &AsahiDrmDevice) {
         let started = now_ns();
         match power::wait_pmp_handover(PMP_HANDOVER_MS) {
             Ok(()) => dev_dbg!(
@@ -1175,22 +1223,151 @@ impl Firmware {
                 error
             ),
         }
-        // (3) Start the CPU: RTKit boot handshake; the firmware rebuilds its own root and
-        // kernel-window tables.
-        republish_step(dev, "coprocessor start", self.restart_coprocessors())?;
-        // (4) As `init.build` mapped the graph after the firmware booted: store again the
-        // kernel-window descriptors the host placed in the firmware's no-map table.
-        let (relinked, links) =
-            republish_step(dev, "kernel-window relink", self.uat.relink_after_cold_boot())?;
-        // Contexts released since the TTBAT rewrite changed only the shadow.
-        self.uat.thaw_reserved_state();
-        // (5) Opening handshake on the restored root.
-        republish_step(dev, "opening handshake", self.open_firmware(dev, shared))?;
-        // (6) Live queues become fresh installs.
-        let (compute, render, settled) = self.reregister_live_work(dev, retired, reclaim)?;
+    }
+
+    /// The M5 firmware's opening, from the log buffers to the retired opening records: shared
+    /// by the first boot ([`Gpu::boot_m5`], after the graph is built and its root entries
+    /// confirmed) and the post-hibernation republish
+    /// ([`Self::republish_m5_after_cold_boot`], on the restored graph). Allocates nothing.
+    fn open_m5_firmware(&mut self, dev: &AsahiDrmDevice, shared: &Shared) -> Result {
+        let t8142 = self.cfg.chip_id == 0x8142;
+        if t8142 {
+            // The J813's log buffers, GFX1's first and then GFX's, in macOS 27.0's order and
+            // before any endpoint of theirs is started.
+            for role in [Role::Secondary, Role::Primary] {
+                let (va, size) = initdata::InitData::fw_log(role);
+                let coprocessor = match role {
+                    Role::Primary => &self.primary,
+                    Role::Secondary => self.secondary.as_ref().ok_or(EINVAL)?,
+                };
+                coprocessor.publish_log_buffer(va, size)?;
+            }
+        } else {
+            self.bridge.regs.prepare_m5_firmware()?;
+        }
+        let ack = shared.variant.init_ack;
+        let primary_root = self.init.root_va(Role::Primary)?;
+        let secondary_root = self.init.root_va(Role::Secondary)?;
+        // The J813's macOS publishes and acknowledges GFX1's InitData first, then GFX's (its
+        // 25G76 trace); the M5 Pro's graph starts with the primary.
+        if t8142 {
+            let secondary = self.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack)?;
+            secondary.notify(MSG_INITDATA_DONE)?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+            self.primary.init(primary_root, ack)?;
+            self.primary.notify(MSG_INITDATA_DONE)?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+        } else {
+            self.primary.init(primary_root, ack)?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+            let secondary = self.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack)?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+        }
+        let secondary = self.secondary.as_mut().ok_or(EINVAL)?;
+        self.primary.notify(MSG_POWER_ON_DONE)?;
+        secondary.notify(MSG_POWER_ON_DONE)?;
+        Gpu::wait_for_opening(dev, &self.init, &self.primary, self.secondary.as_ref())?;
+        dev_info!(dev.as_ref(), "M5 firmware opening records retired\n");
+        Ok(())
+    }
+
+    /// [`Self::republish_after_cold_boot`] for the M5 graph: [`Gpu::boot_m5`]'s order with
+    /// the one-shot allocation and build replaced by in-place resets.
+    ///
+    /// 1. Host RTKit state of both coprocessors and every shared structure the firmware reads
+    ///    at boot ([`Self::reinit_shared_contents`]: TTBAT, the post-build graph, rings).
+    /// 2. T8142: the start control, which the cold boot reset, before either CPU starts.
+    /// 3. The cold PMP, then GFX1 and GFX (T8142's order), and the Fender gating once both run.
+    /// 4. The firmware rebuilt its kernel root: the entries the first boot adopted must be
+    ///    there again; the kernel-window descriptors are stored again under them, confirmed,
+    ///    and mirrored into the secondary root.
+    /// 5. The M5 opening ([`Self::open_m5_firmware`]) on the restored InitData.
+    /// 6. Live queues become fresh installs.
+    fn republish_m5_after_cold_boot(
+        &mut self,
+        dev: &AsahiDrmDevice,
+        shared: &Shared,
+        retired: &mut runtime::RetiredCompute,
+        reclaim: &mut runtime::teardown::ReclaimBatch,
+    ) -> Result {
+        let step = |name: &'static str| {
+            move |e: &Error| dev_err!(dev.as_ref(), "M5 GPU republish failed at {}: {:?}\n", name, e)
+        };
+        if !self.uat.firmware_roots_adopted() {
+            dev_err!(dev.as_ref(), "M5 GPU republish: the first boot adopted no root entries\n");
+            return Err(EINVAL);
+        }
+        let t8142 = self.cfg.chip_id == 0x8142;
+        let pristine = self.init.pristine_size();
+        // (1)
+        self.reinit_mailboxes(dev).inspect_err(step("mailboxes"))?;
+        self.reinit_shared_contents().inspect_err(step("shared contents"))?;
+        // (2)
+        if t8142 {
+            self.bridge
+                .regs
+                .set_m5_start_control()
+                .inspect_err(step("start control"))?;
+        }
+        // (3)
+        Self::wait_pmp_after_cold_boot(dev);
+        if t8142 {
+            self.secondary
+                .as_mut()
+                .ok_or(EINVAL)?
+                .boot()
+                .inspect_err(step("secondary boot"))?;
+            self.primary.boot().inspect_err(step("primary boot"))?;
+            self.bridge
+                .regs
+                .enable_g17_gating()
+                .inspect_err(step("G17 gating"))?;
+        } else {
+            self.primary.boot().inspect_err(step("primary boot"))?;
+            self.secondary
+                .as_mut()
+                .ok_or(EINVAL)?
+                .boot()
+                .inspect_err(step("secondary boot"))?;
+        }
+        // (4)
+        self.uat.invalidate_reserved_tables();
+        let adopted = self
+            .uat
+            .readopt_firmware_root_entries()
+            .inspect_err(step("root adoption"))?;
+        let host_roots = self
+            .uat
+            .restore_host_root_entries()
+            .inspect_err(step("host root entries"))?;
         dev_info!(
             dev.as_ref(),
-            "GPU republish: graph {} KiB restored, {}/{} kernel-window links stored, {} compute queues and {} render pairs reset, {} idle compute queues retired, {} closed contexts settled\n",
+            "M5 GPU republish: {} host root entries stored again\n",
+            host_roots
+        );
+        let (relinked, links) = self
+            .uat
+            .relink_after_cold_boot()
+            .inspect_err(step("kernel-window relink"))?;
+        self.uat.thaw_reserved_state();
+        self.uat
+            .confirm_firmware_root_entries(adopted)
+            .inspect_err(step("root confirmation"))?;
+        self.uat
+            .mirror_secondary_root()
+            .inspect_err(step("secondary root"))?;
+        // (5)
+        self.open_m5_firmware(dev, shared)
+            .inspect_err(step("opening"))?;
+        // (6)
+        let (compute, render, settled) = self
+            .reregister_live_work(dev, retired, reclaim)
+            .inspect_err(step("live queues"))?;
+        dev_info!(
+            dev.as_ref(),
+            "M5 GPU republish: graph {} KiB restored, {}/{} kernel-window links stored, {} compute queues and {} render pairs reset, {} idle compute queues retired, {} closed contexts settled\n",
             pristine / 1024,
             relinked,
             links,
@@ -1917,10 +2094,16 @@ impl Shared {
         {
             let state = self.state.lock();
             let firmware = state.as_deref().ok_or(ENODEV)?;
-            if !firmware.init.has_pristine() || firmware.cfg.adopt_root_entries {
+            // A cold restore re-boots the firmware against the post-build graph and, where the
+            // host adopts the firmware's root entries, checks them against the first boot's.
+            let pristine = firmware.init.has_pristine();
+            let roots = !firmware.cfg.adopt_root_entries || firmware.uat.firmware_roots_adopted();
+            if !pristine || !roots {
                 dev_warn!(
                     self.dev.as_ref(),
-                    "Refusing hibernation: no cold restore for this GPU session\n"
+                    "Refusing hibernation: no cold restore for this GPU session (graph copy {}, root entries {})\n",
+                    if pristine { "kept" } else { "missing" },
+                    if roots { "adopted" } else { "missing" }
                 );
                 return Err(EBUSY);
             }
@@ -1987,6 +2170,16 @@ impl Shared {
         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
         if !firmware.quiescent(now_ns())? {
             return Ok(false);
+        }
+        // The kernel root lives in the boot loader's reserved page, which the image does not
+        // hold: keep the host's entries of it in the image for the cold restart.
+        if firmware.cfg.adopt_root_entries {
+            let host = firmware.uat.save_host_root_entries()?;
+            dev_info!(
+                self.dev.as_ref(),
+                "GPU: {} host root entries saved for the hibernation image\n",
+                host
+            );
         }
         firmware.frozen = true;
         firmware.uat.set_reserved_stale(true);
@@ -2111,6 +2304,8 @@ impl Shared {
                         now_ns().saturating_sub(started) / 1_000_000
                     );
                 }
+                // SAFETY: Records a bit for the hibernation heartbeat; no other effect.
+                unsafe { kernel::bindings::pm_hibernate_health(1 << 4) };
                 self.reopen_after_freeze();
                 // Teardown held while frozen.
                 self.queue_reclaims();
@@ -2121,6 +2316,8 @@ impl Shared {
                     "GPU firmware republish after resume failed: {:?}; device lost\n",
                     error
                 );
+                // SAFETY: Records a bit for the hibernation heartbeat; no other effect.
+                unsafe { kernel::bindings::pm_hibernate_health(1 << 5) };
                 self.lose_device_quietly();
             }
         }
@@ -2892,50 +3089,14 @@ impl Gpu {
             .confirm_firmware_root_entries(root_entries)
             .inspect_err(at("root confirmation"))?;
         session.uat.mirror_secondary_root().inspect_err(at("secondary root"))?;
-        if cfg.chip_id == 0x8142 {
-            // The J813's log buffers, GFX1's first and then GFX's, in macOS 27.0's order and
-            // before any endpoint of theirs is started.
-            for role in [Role::Secondary, Role::Primary] {
-                let (va, size) = initdata::InitData::fw_log(role);
-                let coprocessor = match role {
-                    Role::Primary => &session.primary,
-                    Role::Secondary => session.secondary.as_ref().ok_or(EINVAL)?,
-                };
-                coprocessor.publish_log_buffer(va, size).inspect_err(at("log buffer"))?;
-            }
-        } else {
-            session
-                .bridge
-                .regs
-                .prepare_m5_firmware()
-                .inspect_err(at("M5 preparation"))?;
-        }
-        let ack = shared.variant.init_ack;
-        let primary_root = session.init.root_va(Role::Primary)?;
-        let secondary_root = session.init.root_va(Role::Secondary)?;
-        // The J813's macOS publishes and acknowledges GFX1's InitData first, then GFX's (its
-        // 25G76 trace); the M5 Pro's graph starts with the primary.
-        if cfg.chip_id == 0x8142 {
-            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
-            secondary.notify(MSG_INITDATA_DONE)?;
-            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
-            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
-            session.primary.notify(MSG_INITDATA_DONE)?;
-            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
-        } else {
-            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
-            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
-            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
-            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
-        }
-        let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-        session.primary.notify(MSG_POWER_ON_DONE)?;
-        secondary.notify(MSG_POWER_ON_DONE)?;
-        Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())
-            .inspect_err(at("opening records"))?;
-        dev_info!(dev.as_ref(), "M5 firmware opening records retired\n");
+        // The graph as built, before the firmware sees its InitData: what a firmware the boot
+        // loader cold-restarts across a hibernation must find again
+        // (Firmware::republish_m5_after_cold_boot). Best effort: without it only hibernation
+        // is refused.
+        session.init.capture_pristine(dev);
+        session
+            .open_m5_firmware(dev, shared)
+            .inspect_err(at("M5 opening"))?;
         Ok(core::mem::ManuallyDrop::into_inner(retained))
     }
 

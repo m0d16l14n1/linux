@@ -87,6 +87,7 @@ static struct arch_hibernate_hdr {
 
 	/* What the boot loader decided for the boot that wrote the image. */
 	u64		boot_layout;
+	/* Its parts (chosen + mailbox, CPUs, memory), to name the one that differs. */
 } resume_hdr;
 
 static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
@@ -183,8 +184,12 @@ static u64 hibernate_boot_layout(void)
 		if (of_property_read_u64(np, "cpu-release-addr", &rel))
 			continue;
 		hwid = of_get_cpu_hwid(np, 0);
-		kept = hibernate_platform_pfn_nosave(PHYS_PFN(rel));
-		if (lay.have_base)
+		/*
+		 * The boot CPU has no spin-table slot (release address 0): it is not relative to
+		 * the platform's base, and "0 - base" would move with the boot loader every boot.
+		 */
+		kept = rel && hibernate_platform_pfn_nosave(PHYS_PFN(rel));
+		if (lay.have_base && rel)
 			rel -= lay.base;
 		h = arm64_hibernate_layout_mix(h, &hwid, sizeof(hwid));
 		h = arm64_hibernate_layout_mix(h, &rel, sizeof(rel));

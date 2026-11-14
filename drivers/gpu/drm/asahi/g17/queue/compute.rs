@@ -271,16 +271,21 @@ impl Graph {
         let page = mmu::UAT_PGSZ as u64;
         let pointers = self.pointers;
         let graph_va = self.graph.gpu_va();
+        let record = QueueRecordArgs {
+            pointers_va: graph_va + CURSORS as u64,
+            items_va: graph_va + ITEMS as u64,
+            job_list_va: context.work_head_va(),
+            scheduler_va: context.scheduler_va(),
+            owner_pid: context.owner_pid(),
+            policy: context.policy(),
+        };
+        // As `Graph::new` writes it, in the family's own record format.
+        let m5 = self.m5;
         self.graph.bytes_mut().fill(0);
         self.graph.initialize::<GraphLayout>(0, |view| {
-            view.queue = QueueRecord::new(&QueueRecordArgs {
-                pointers_va: graph_va + CURSORS as u64,
-                items_va: graph_va + ITEMS as u64,
-                job_list_va: context.work_head_va(),
-                scheduler_va: context.scheduler_va(),
-                owner_pid: context.owner_pid(),
-                policy: context.policy(),
-            });
+            if !m5 {
+                view.queue = QueueRecord::new(&record);
+            }
             view.pointers = PointerBlock::new(&pointers)?;
             view.jobs = JobListHead::new(graph_va + 0x200);
             Ok(())
@@ -289,12 +294,28 @@ impl Graph {
             *view = PointerBlock::new(&pointers)?;
             Ok(())
         })?;
-        let support_va = self.support.gpu_va();
+        if self.m5 {
+            // The M5 record is shorter than the G17P slot; the rest of the slot stays zero.
+            self.graph
+                .write(0, crate::g17::fw::m5::queue::QueueRecord::new(&record)?)?;
+        }
+        // The M5 support page is firmware-only and starts zero; G17P's carries its pointers.
         self.support.bytes_mut().fill(0);
-        self.support.write(0, support_va + page)?;
-        self.support.write(0x100, support_va + page + 4)?;
-        self.support.write(0x110, 0x50u32)?;
-        self.support.write(mmu::UAT_PGSZ + 4, 1u32)?;
+        if !self.m5 {
+            let support_va = self.support.gpu_va();
+            self.support.write(0, support_va + page)?;
+            self.support.write(0x100, support_va + page + 4)?;
+            self.support.write(0x110, 0x50u32)?;
+            self.support.write(mmu::UAT_PGSZ + 4, 1u32)?;
+        }
+        if let Some(timestamps) = self.m5_timestamps.as_ref() {
+            // Shared with the commands that name its slots, none of which is outstanding.
+            let size = timestamps.size();
+            let pointer = timestamps.pointer(0, size)?;
+            // SAFETY: The checked range stays mapped; the cold firmware never ran this queue
+            // and the host holds no command of it (`cold_resettable`).
+            unsafe { pointer.write_bytes(0, size) };
+        }
         for object in [&mut self.preempt, &mut self.usage, &mut self.operand, &mut self.records] {
             object.bytes_mut().fill(0);
         }
@@ -888,24 +909,25 @@ impl Queue {
     /// reallocating or remapping anything: the next command installs the queue with the
     /// cold-restarted firmware (install configuration, first descriptor, predecessor, QID
     /// publication). Its ordinal restarts with its kick ring. The caller rewrites the pool's
-    /// page-pool descriptor row with the returned `(slot, page list, blocks)` and marks the
-    /// QID unpublished.
+    /// page-pool descriptor row with the returned descriptor (the family's format) and marks
+    /// the QID unpublished.
     ///
     /// A never-published owner change has nothing to roll back to: the cold firmware never
     /// ran either owner. Its previous binding is taken out and returned for an off-lock drop,
     /// so a release of the new owner before its first command takes the cancel path.
     pub(crate) fn reset_after_cold_boot(
         &mut self,
-    ) -> Result<((u16, u64, usize), Option<RetiredPrevious>)> {
+    ) -> Result<(PoolDescriptor, Option<RetiredPrevious>)> {
         if !self.cold_resettable() {
             return Err(EBUSY);
         }
         let context = self.binding.as_ref().ok_or(EIO)?.context.clone();
         self.graph.reset_after_cold_boot(&context)?;
         self.kick.reset_after_cold_boot()?;
-        let blocks = self.pool.reset_after_cold_boot()?;
-        let row = (self.pool.id(), self.pool.page_list_va()?, blocks);
+        let row = self.pool.reset_after_cold_boot()?;
         self.installed = false;
+        // M5: the next publication installs the queue first (`install_m5`).
+        self.m5_install = None;
         self.outer_started = 0;
         self.published_config = None;
         self.config_cache = None;

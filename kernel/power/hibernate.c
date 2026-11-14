@@ -83,6 +83,37 @@ static atomic_t hibernate_atomic = ATOMIC_INIT(1);
 /* Set when swsusp_arch_suspend() returned in a kernel restored from an image. */
 static bool hibernate_restored;
 
+void (*pm_hibernate_note_hook)(u8 step, u16 seq, u8 tag, bool raw);
+EXPORT_SYMBOL_GPL(pm_hibernate_note_hook);
+
+/* PM_HIB_HEALTH_* reported since this kernel was restored; 0 in the image (cleared at the snapshot). */
+static atomic_t hibernate_health = ATOMIC_INIT(0);
+
+void pm_hibernate_health(u8 bits)
+{
+	if (READ_ONCE(hibernate_restored))
+		atomic_or(bits, &hibernate_health);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_health);
+
+u8 pm_hibernate_health_get(void)
+{
+	return atomic_read(&hibernate_health);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_health_get);
+
+void pm_hibernate_note_dev(u8 step, u16 seq, struct device *dev)
+{
+	const char *name = dev_name(dev);
+	u8 tag = 0;
+
+	while (*name)
+		tag = tag * 31 + *name++;
+	pm_hibernate_note(step, seq, tag, false);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_note_dev);
+
+
 /**
  * pm_hibernate_is_restored - Whether this kernel was just restored from an image.
  *
@@ -256,7 +287,8 @@ static int __init hibernation_platform_report(void)
 		pr_info("disabled on this platform: %s\n", hibernation_platform_blocked_reason);
 	return 0;
 }
-late_initcall(hibernation_platform_report);
+/* After aura-hibernate's late_initcall has read the boot object's layout. */
+late_initcall_sync(hibernation_platform_report);
 
 /**
  * hibernation_set_ops - Set the global hibernate operations.
@@ -536,6 +568,7 @@ static int create_image(int platform_mode)
 			WRITE_ONCE(hibernate_restored_cold, -ENODATA);
 		hibernate_load_record.magic = 0;
 		WRITE_ONCE(hibernate_restored, true);
+		pm_hibernate_note(PM_HIB_NOTE_RESTORED, 0, 0, true);
 	}
 
 	platform_leave(platform_mode);
@@ -557,6 +590,8 @@ static int create_image(int platform_mode)
  Platform_finish:
 	platform_finish(platform_mode);
 
+	if (!in_suspend)
+		pm_hibernate_note(PM_HIB_NOTE_CPUS_BACK, 0, 0, true);
 	dpm_resume_start(hibernate_resume_event(error));
 
 	return error;
@@ -576,6 +611,7 @@ int hibernation_snapshot(int platform_mode)
 	pm_suspend_clear_flags();
 	WRITE_ONCE(hibernate_restored, false);
 	WRITE_ONCE(hibernate_restored_cold, -ENODATA);
+	atomic_set(&hibernate_health, 0);
 	error = platform_begin(platform_mode);
 	if (error)
 		goto Close;
@@ -624,13 +660,19 @@ int hibernation_snapshot(int platform_mode)
 		swsusp_free();
 
 	msg = hibernate_resume_event(error);
+	if (!in_suspend)
+		pm_hibernate_note(PM_HIB_NOTE_EARLY_DONE, 0, 0, false);
 	dpm_resume(msg);
+	if (!in_suspend)
+		pm_hibernate_note(PM_HIB_NOTE_DEVICES_DONE, 0, 0, false);
 
 	if (error || !in_suspend)
 		pm_restore_gfp_mask();
 
 	console_resume_all();
 	dpm_complete(msg);
+	if (!in_suspend)
+		pm_hibernate_note(PM_HIB_NOTE_COMPLETE_DONE, 0, 0, false);
 
  Close:
 	platform_end(platform_mode);
@@ -668,6 +710,7 @@ static int resume_target_kernel(bool platform_mode)
 		pr_err("Some devices failed to power down, aborting resume\n");
 		return error;
 	}
+	pm_hibernate_note(PM_HIB_NOTE_QUIESCED, 0, 0, true);
 
 	error = platform_pre_restore(platform_mode);
 	if (error)
@@ -692,6 +735,7 @@ static int resume_target_kernel(bool platform_mode)
 		hibernate_load_record.other_boot = !hibernate_loading_own_image;
 		hibernate_load_record.self_phys = __pa_symbol(&hibernate_load_record);
 		hibernate_load_record.magic = HIBERNATE_LOAD_MAGIC;
+		pm_hibernate_note(PM_HIB_NOTE_JUMP, 0, 0, true);
 		error = swsusp_arch_resume();
 		/*
 		 * The code below is only ever reached in case of a failure.
@@ -927,6 +971,7 @@ static int load_image_and_restore(void)
 		 */
 		if (swsusp_invalidate_sig())
 			pr_warn("could not invalidate the image signature; a failed restore may repeat\n");
+		pm_hibernate_note(PM_HIB_NOTE_IMAGE_READ, 0, 0, false);
 	}
 	swsusp_close();
 	if (!error)
@@ -1084,12 +1129,18 @@ int hibernate(void)
  Exit:
 	filesystems_thaw();
  Notify:
+	if (pm_hibernate_is_restored())
+		pm_hibernate_note(PM_HIB_NOTE_NOTIFIERS, 0, 0, false);
 	pm_notifier_call_chain(PM_POST_HIBERNATION);
+	if (pm_hibernate_is_restored())
+		pm_hibernate_note(PM_HIB_NOTE_NOTIFIERS_DONE, 0, pm_hibernate_health_get(), false);
  Restore:
 	pm_restore_console();
 	hibernate_release();
  Unlock:
 	unlock_system_sleep(sleep_flags);
+	if (pm_hibernate_is_restored())
+		pm_hibernate_note(PM_HIB_NOTE_EXIT, 0, pm_hibernate_health_get(), false);
 	pr_info("hibernation exit\n");
 
 	return error;

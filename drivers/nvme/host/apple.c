@@ -221,6 +221,8 @@ struct apple_nvme_hw {
 	 * polled idle at the commit and a warm restart after the wake.
 	 */
 	bool sleep_coproc;
+	/* ... or derived and never run: only with nvme_apple.sleep_untested */
+	bool sleep_untested;
 	/* The last endpoint map reply of that warm restart; 0: the whole map again. */
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
@@ -338,6 +340,15 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
+
+/*
+ * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
+ * default: the root disk stays up through a sleep the SoC refuses.
+ */
+static bool sleep_untested;
+module_param(sleep_untested, bool, 0444);
+MODULE_PARM_DESC(sleep_untested,
+		 "Stop ANS for a deep sleep where that path is untested (default 0)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -1332,6 +1343,8 @@ static void apple_nvme_quarantine(struct apple_nvme *anv, int error)
 {
 	int i;
 
+	pm_hibernate_health(PM_HIB_HEALTH_NVME_FAILED);
+
 	/* Called under disable_lock after both dispatch queues are quiesced. */
 	WRITE_ONCE(anv->quarantined, true);
 	/*
@@ -1489,6 +1502,8 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	struct apple_nvme_queue *q = iod->q;
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
+
+	pm_hibernate_health(PM_HIB_HEALTH_NVME_TIMEOUT);
 	struct nvme_completion *cqe = &q->cqes[q->cq_head];
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
 	unsigned long flags;
@@ -2087,6 +2102,7 @@ rtkit_ready:
 		ret = -ENODEV;
 		goto out_remove_sq;
 	}
+	pm_hibernate_health(PM_HIB_HEALTH_NVME_LIVE);
 
 	/*
 	 * nvme_start_ctrl() sends Set Features if the controller reports
@@ -2761,7 +2777,9 @@ static int apple_nvme_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
 
-	if (anv->hw->sleep_coproc) {
+	if (anv->hw->sleep_coproc && (!anv->hw->sleep_untested || sleep_untested)) {
+		if (anv->hw->sleep_untested)
+			dev_warn(anv->dev, "firmware stop for sleep enabled, untested on this SoC\n");
 		anv->sleep_registered =
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, true,
 						     apple_nvme_sleep_last_stop, anv);
@@ -3213,6 +3231,7 @@ static int apple_nvme_restore_post_m4(struct apple_nvme *anv)
 	apple_nvme_set_reset_ready(anv, true);
 	dev_info(anv->dev,
 		 "hibernation restore: adopted the boot loader's ANS session\n");
+	pm_hibernate_health(PM_HIB_HEALTH_NVME_ADOPTED);
 	return 0;
 }
 
@@ -3301,6 +3320,12 @@ static const struct apple_nvme_hw apple_nvme_t8142_hw = {
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
+	/* T8140's values, as T8132 runs them: never run on T8142. */
+	.sleep_coproc = true,
+	.sleep_untested = true,
+	.sleep_epmap_last_mask = BIT(0),
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
 

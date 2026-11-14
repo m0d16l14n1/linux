@@ -1166,13 +1166,28 @@ impl ComputePool {
     }
 
     /// Returns a populated pool to its construction state for a cold-restarted firmware that
-    /// never saw it: page and run tables repopulated, a fresh control header (completed
-    /// counter zero) and a zero state (submitted counter zero). Returns the block count for
-    /// the page-pool descriptor row the caller rewrites. Only with the GPU idle.
-    pub(crate) fn reset_after_cold_boot(&mut self) -> Result<usize> {
+    /// never saw it: page and run tables (M5: directory and free list) repopulated, a fresh
+    /// control header (completed counter zero) and a zero state (submitted counter zero).
+    /// Returns the page-pool descriptor row the caller rewrites, in the family's format. Only
+    /// with the GPU idle.
+    pub(crate) fn reset_after_cold_boot(&mut self) -> Result<PoolDescriptor> {
+        let id = self.id;
+        let state_va = self.state.gpu_va();
+        if self.m5 {
+            let pages = self.pages.as_mut().ok_or(EAGAIN)?;
+            // As `Pages::m5` leaves it: the client keeps its alias of the same backing, whose
+            // blocks held only the previous firmware instance's transient data.
+            pages.reset_for_client()?;
+            self.control.bytes_mut().fill(0);
+            Self::initialize_control(&mut self.control, &*pages, id, state_va, [0; 8])?;
+            self.state.bytes_mut().fill(0);
+            fence(Ordering::SeqCst);
+            return pages.descriptor(id);
+        }
         let pages = self.pages.as_ref().ok_or(EAGAIN)?;
         let PageLayout::Neo { blocks, .. } = pages.layout else { return Err(EINVAL); };
         pages.repopulate()?;
+        let page_list = pages.page_list_va();
         let header = FreeListControl::compute(&FreeListArgs {
             buffer_slot: u32::from(self.id),
             class: FreeListClass::One,
@@ -1185,7 +1200,7 @@ impl ComputePool {
         self.control.write(0, header)?;
         self.state.bytes_mut().fill(0);
         fence(Ordering::SeqCst);
-        Ok(blocks)
+        Ok(PoolDescriptor::Neo { slot: id, page_list, blocks })
     }
 
     /// EPERM for a VM other than the one the backing serves.

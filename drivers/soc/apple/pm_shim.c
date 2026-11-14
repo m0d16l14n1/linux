@@ -45,6 +45,16 @@ module_param(sleep_refuse_before_send, bool, 0644);
 MODULE_PARM_DESC(sleep_refuse_before_send,
 		 "Test only: refuse the next prepared deep sleep before sending SEP SLEEP");
 
+/*
+ * J815 b55: the restored kernel died within ~1 s of this re-probe returning (PMU breadcrumb a6 22 for the
+ * SEP, nothing after). Until that is understood, a resume from disk drops the session (Touch ID down until a
+ * reboot, as when the cold boot cannot be told) unless this asks for the re-probe.
+ */
+static bool hib_reprobe;
+module_param(hib_reprobe, bool, 0644);
+MODULE_PARM_DESC(hib_reprobe,
+		 "After a resume from disk that cold-booted the SEP, probe it again (default off: Touch ID down until a reboot)");
+
 static int (*sep_pm_event)(int event);
 static struct device *sep_pm_dev;
 static int (*sep_pm_sleep)(void);

@@ -842,7 +842,15 @@ impl Manager {
             buffer_id: self.buffer_id.into(),
             generation: self.generation,
         };
-        self.graph.initialize::<fw::Graph>(0, |view| view.init(&args))?;
+        // In the layout `Self::new` wrote: the Neo graph, or M5's from its block geometry.
+        let geometry = self.tvb.geometry;
+        if geometry == BlockGeometry::NEO {
+            self.graph.initialize::<fw::Graph>(0, |view| view.init(&args))?;
+        } else {
+            let bytes = self.graph.bytes_mut();
+            bytes.fill(0);
+            self.layout.initialize(geometry, &args, bytes)?;
+        }
         fence(Ordering::SeqCst);
         self.initialized = false;
         Ok(())

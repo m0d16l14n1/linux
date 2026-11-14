@@ -19,6 +19,12 @@ __rust_helper bool rust_helper_pm_hibernate_is_restored(void)
 	return pm_hibernate_is_restored();
 }
 
+/* An inline without CONFIG_HIBERNATION, so Rust reaches it here. */
+__rust_helper void rust_helper_pm_hibernate_health(u8 bits)
+{
+	pm_hibernate_health(bits);
+}
+
 /* An inline on most configurations, so Rust reaches it here (linux/soc/apple/sleep.h). */
 __rust_helper bool rust_helper_apple_sleep_power_loss(void)
 {

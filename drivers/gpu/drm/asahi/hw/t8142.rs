@@ -44,7 +44,11 @@ pub(crate) const PROBE: Config = Config {
     m5: Some(&crate::g17::fw::m5::initdata::J714),
     adopt_root_entries: true,
     fabric_bridge: false,
-    sleep_restart: false,
+    // The same G17 firmware generation as T8140's: rings and state in DRAM, the whole stop at the
+    // sleep's commit (asahi_g17_commit_stop, with the domain raised first), and a warm RTKit
+    // restart after the SoC's power comes back. Without it .prepare refuses every deep sleep
+    // (J815 boot 08ab098a: genpd_prepare -16). Not yet run on an M5 across a real deep sleep.
+    sleep_restart: true,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428_M5),

@@ -2033,9 +2033,9 @@ impl Pair {
             descriptors.word(offset + 12)?,
         ];
         let previous = words.map(|word| word.load(Ordering::Relaxed));
-        let pages: u32 = (self.memory.manager.blocks()
-            * crate::hw::t8140::resources::TVB_PAGES_PER_BLOCK)
-            .try_into()?;
+        // As `install_memory` counts them: the manager's own block geometry (M5's differs
+        // from T8140's pages per block).
+        let pages = self.memory.manager.page_count()?;
         let next = crate::g17::fw::buffer::reload_descriptor(
             previous,
             self.memory.manager.page_list_va(),

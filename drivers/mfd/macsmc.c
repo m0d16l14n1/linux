@@ -846,6 +846,7 @@ static int apple_smc_restore(struct device *dev)
 	 * restored image, so only the firmware flag has to be re-armed.
 	 */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
+	pm_hibernate_health(PM_HIB_HEALTH_SMC_OK);
 
 	return 0;
 }
