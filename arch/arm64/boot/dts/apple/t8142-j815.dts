@@ -502,3 +502,33 @@
 &ane {
 	status = "okay";
 };
+
+/* Both JPEG engines and their DART. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
+
+/* The ProRes encoder; it probes only with the Mac's own apple/prores-t8142-init.bin. */
+&ps_scodec {
+	status = "okay";
+};
+
+&apr_dart {
+	status = "okay";
+};
+
+&apr {
+	status = "okay";
+};
