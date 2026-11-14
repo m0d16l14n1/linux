@@ -2661,11 +2661,13 @@ static int magicmouse_probe(struct hid_device *hdev,
 		/*
 		 * The J616s controller classes contacts the same way, but its
 		 * fingers reach a tool area of 2475, so only the class marks its
-		 * palms there.
+		 * palms there. The J815's tool areas are not recorded yet, so it
+		 * also trusts only the class.
 		 */
 		msc->mtp_palms = msc->mtp_palm_size ||
 				 (!msc->mtp_c1fe &&
-				  of_machine_is_compatible("apple,j616s"));
+				  (of_machine_is_compatible("apple,j616s") ||
+				   of_machine_is_compatible("apple,j815")));
 		of_node_put(np);
 
 		/*
