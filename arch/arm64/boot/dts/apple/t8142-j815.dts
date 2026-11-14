@@ -535,6 +535,26 @@
 };
 
 /*
+ * SIO AES engine, software keys only. It registers below the CPU's aes-ce, so
+ * it is used only when asked for by driver name.
+ */
+&ps_sio {
+	status = "okay";
+};
+
+&ps_aes {
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&aes {
+	status = "okay";
+};
+
+/*
  * The MagSafe 3 port's PD controller: ADT hpm5 on nub-spmi-a0, SID 8, port-type
  * 0x11. It has no USB data path, so it gets no connector node; tipd registers a
  * Type-C port and a power supply for it, as on J714s. The bus is polled on
