@@ -1524,29 +1524,48 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 
 /*
  * Whether TEXT is the build's firmware: as loaded (text_pin, measured) or as
- * code, with the loader's text_env words zeroed (text_code_pin, from the
- * image). Both digests are returned for the log; code is zero without a
- * code pin.
+ * code, with the loader-filled environment sections zeroed (text_code_pin,
+ * from the image). Both digests are returned for the log; code is zero
+ * without a code pin or with an environment table that does not fit TEXT.
  */
 static bool ane_fw_text_pinned(const struct ane_fw_platform *soc, const u8 *text,
 			       size_t size, u8 raw[SHA256_DIGEST_SIZE],
 			       u8 code[SHA256_DIGEST_SIZE])
 {
-	static const u8 zero[64];
-	size_t env = soc->text_env, env_size = soc->text_env_size;
+	static const u8 zero[256];
 	struct sha256_ctx hash;
+	size_t pos = 0;
+	unsigned int i;
 	bool ok;
 
 	sha256(text, size, raw);
 	ok = soc->text_pin && !memcmp(raw, soc->text_pin, SHA256_DIGEST_SIZE);
 	memset(code, 0, SHA256_DIGEST_SIZE);
-	if (!soc->text_code_pin || !env_size || env_size > sizeof(zero) ||
-	    size < env_size || env > size - env_size)
+	if (!soc->text_code_pin || !soc->text_env[0].size)
 		return ok;
+	for (i = 0; i < ARRAY_SIZE(soc->text_env) && soc->text_env[i].size; i++) {
+		const struct ane_fw_text_env *env = &soc->text_env[i];
+
+		if (env->offset < pos || env->offset > size || env->size > size - env->offset)
+			return ok;
+		pos = env->offset + env->size;
+	}
 	sha256_init(&hash);
-	sha256_update(&hash, text, env);
-	sha256_update(&hash, zero, env_size);
-	sha256_update(&hash, text + env + env_size, size - env - env_size);
+	pos = 0;
+	for (i = 0; i < ARRAY_SIZE(soc->text_env) && soc->text_env[i].size; i++) {
+		const struct ane_fw_text_env *env = &soc->text_env[i];
+		size_t left = env->size;
+
+		sha256_update(&hash, text + pos, env->offset - pos);
+		while (left) {
+			size_t n = min(left, sizeof(zero));
+
+			sha256_update(&hash, zero, n);
+			left -= n;
+		}
+		pos = env->offset + env->size;
+	}
+	sha256_update(&hash, text + pos, size - pos);
 	sha256_final(&hash, code);
 	return ok || !memcmp(code, soc->text_code_pin, SHA256_DIGEST_SIZE);
 }
@@ -2189,7 +2208,21 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 
 		if (text) {
 			bool pinned = ane_fw_text_pinned(soc, text, h.size[0], digest, code);
+			size_t pre = soc->text_env[0].offset;
 
+			/*
+			 * On a code pin miss, the code before the first loader-filled
+			 * section tells a loader write elsewhere from a different build.
+			 */
+			if (!pinned && soc->text_code_pin && soc->text_env[0].size &&
+			    pre <= h.size[0]) {
+				u8 head[SHA256_DIGEST_SIZE];
+
+				sha256(text, pre, head);
+				dev_info(&pdev->dev,
+					 "H17 ANE: TEXT before 0x%zx sha256 %*phN\n",
+					 pre, (int)sizeof(head), head);
+			}
 			memunmap(text);
 			mapped = true;
 			h.text_ok = ane_fw_preload_ranges_valid(soc, h.phys, h.size, h.dva) &&

@@ -221,21 +221,22 @@ const struct ane_fw_platform ane_t6050_platform = {
 	.pmgr_subblock = 0xc008,					\
 	.dart_compatible = "apple,t8142-ane-dart",			\
 	.dart_revision = 0x204,						\
-	.dapf_count = 4,						\
-	.text_env_size = 0x20
+	.dapf_count = 4
 
 /*
  * The macOS 27.2 (26B123) firmware, which 27.2.1 (26B131) ships unchanged:
  * the 27.2 host ADT has iBoot preload TEXT 0xbc000 and DATA 0x2b0000, DATA
- * at 0x100_000b_c000; both end where 27.0's do. Its TEXT has text_env at
- * 0xb8f80. The code pin is from the image (h17_ane_fw_theia_j73y,
- * RTKit 3514.41.1).
+ * at 0x100_000b_c000; both end where 27.0's do. Its TEXT has two sections
+ * the loader fills: ce_env (0x4000 bytes at 0xb4f80, new in this build, all
+ * zero in the image but its first byte) and text_env (0x20 at 0xb8f80). The
+ * code pin is from the image (h17_ane_fw_theia_j73y, RTKit 3514.41.1) with
+ * both zeroed; with text_env alone the first J815 boot missed it.
  */
 static const u8 ane_t8142_code_26b123[] = {
-	0xec, 0x40, 0xac, 0x8b, 0x36, 0x23, 0xee, 0xa7,
-	0x5b, 0x00, 0xe9, 0x2a, 0xbe, 0x12, 0x92, 0x1c,
-	0xcd, 0xd6, 0xde, 0x92, 0xa0, 0x47, 0xea, 0x84,
-	0x14, 0xa6, 0xf2, 0x12, 0x96, 0x79, 0xf8, 0x3e,
+	0x9b, 0x57, 0x48, 0x67, 0x90, 0xff, 0x41, 0x45,
+	0x8e, 0x1d, 0x33, 0x46, 0x34, 0xed, 0x36, 0x53,
+	0xa4, 0xb4, 0xd3, 0xcd, 0xf4, 0x43, 0xe2, 0x17,
+	0x7d, 0x95, 0x6d, 0x11, 0x1d, 0xa7, 0xf4, 0xc2,
 };
 
 static const struct ane_fw_platform ane_t8142_platform_26b123 = {
@@ -244,7 +245,7 @@ static const struct ane_fw_platform ane_t8142_platform_26b123 = {
 	.preload_dva = { 0x10000000000, 0x100000bc000 },
 	.preload_size = { 0xbc000, 0x2b0000 },
 	.text_code_pin = ane_t8142_code_26b123,
-	.text_env = 0xb8f80,
+	.text_env = { { 0xb4f80, 0x4000 }, { 0xb8f80, 0x20 } },
 };
 
 /*
@@ -274,7 +275,7 @@ const struct ane_fw_platform ane_t8142_platform = {
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.text_pin = ane_t8142_text_26a428,
 	.text_code_pin = ane_t8142_code_26a428,
-	.text_env = 0xbc280,
+	.text_env = { { 0xbc280, 0x20 } },
 	.next_build = &ane_t8142_platform_26b123,
 };
 
