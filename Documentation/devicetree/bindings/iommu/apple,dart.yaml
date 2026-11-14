@@ -277,6 +277,15 @@ properties:
       with the registers of the DART's revision, and leave the DART unlocked
       on error. For a T8110 DART that nothing initialises before Linux.
 
+  apple,tlb-busy-timeout-us:
+    description:
+      How long a TLB command of a T8110 DART may stay busy before it is
+      reported as timed out, in microseconds. A display scanout DART can hold
+      a ranged invalidation until its pipe is done with the frame it is
+      reading, longer than the default 2000.
+    minimum: 1
+    maximum: 100000
+
   apple,ctc-flush:
     type: boolean
     description:

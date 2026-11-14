@@ -442,6 +442,14 @@ struct apple_dart {
 	bool ctc_flush;
 	bool client_partitions;
 
+	/*
+	 * How long a T8110 TLB command may stay busy, in microseconds
+	 * (apple,tlb-busy-timeout-us); DART_T8110_FLUSH_BUSY_TIMEOUT if unset.
+	 * A display scanout DART can hold a ranged invalidation until the pipe
+	 * lets go of the translations it has fetched for the frame being read.
+	 */
+	u32 tlb_busy_timeout_us;
+
 	/* J713 internal display DARTs, borrowed from the running DCP. */
 	struct apple_dart_dcp *dcp;
 	struct apple_dart_dcp *frontend[2];
@@ -1686,7 +1694,10 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 				   u32 command, bool range, u64 first, u64 last)
 {
 	struct apple_dart *dart = stream_map->dart;
+	/* Zero: a DART set up outside probe. read_poll_timeout's 0 waits for ever. */
+	u32 busy_us = dart->tlb_busy_timeout_us ?: DART_T8110_FLUSH_BUSY_TIMEOUT;
 	unsigned long flags;
+	u64 start_ns, slow_us = 0;
 	u32 status;
 	int sid, ret = 0;
 
@@ -1702,7 +1713,7 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 
 		ret = read_poll_timeout_atomic(apple_dart_readl, status,
 			!(status & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
+			busy_us, false, dart,
 			DART_T8110_TLB_CMD);
 		if (ret)
 			break;
@@ -1718,12 +1729,14 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 		}
 		dma_wmb();
 		apple_dart_writel(dart, val, DART_T8110_TLB_CMD);
+		start_ns = ktime_get_ns();
 		ret = read_poll_timeout_atomic(apple_dart_readl, status,
 			!(status & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
+			busy_us, false, dart,
 			DART_T8110_TLB_CMD);
 		if (ret)
 			break;
+		slow_us = max_t(u64, slow_us, div_u64(ktime_get_ns() - start_ns, NSEC_PER_USEC));
 	}
 	/* A V2 flush leaves the context cache alone: flush all of it after. */
 	if (!ret && dart->ctc_flush && dart->version >= 0x0202 &&
@@ -1732,8 +1745,12 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 	spin_unlock_irqrestore(&dart->lock, flags);
 	if (ret)
 		dev_err_ratelimited(dart->dev,
-			"TLB command %#x for stream %d timed out (%#x)\n",
-			command, sid, status);
+			"TLB command %#x for stream %d timed out after %u us (%#x)\n",
+			command, sid, busy_us, status);
+	else if (slow_us > DART_T8110_FLUSH_BUSY_TIMEOUT)
+		/* Would have timed out with the default wait: how long it really takes. */
+		dev_info_ratelimited(dart->dev, "TLB command %#x%s took %llu us\n",
+				     command, range ? " (range)" : "", slow_us);
 	return ret;
 }
 
@@ -5304,6 +5321,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->gapf_boot = U32_MAX;
 		dart->gapf_protect = BIT(bit);
 	}
+	dart->tlb_busy_timeout_us = DART_T8110_FLUSH_BUSY_TIMEOUT;
+	of_property_read_u32(dev->of_node, "apple,tlb-busy-timeout-us",
+			     &dart->tlb_busy_timeout_us);
+	if (!dart->tlb_busy_timeout_us || dart->tlb_busy_timeout_us > 100000)
+		return dev_err_probe(dev, -EINVAL, "apple,tlb-busy-timeout-us out of range\n");
+
 	/* T8132's ISP DART names its DAPF page but has no ranges to restore. */
 	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf") &&
 	    of_property_present(pdev->dev.of_node, "apple,dapf-ranges")) {
