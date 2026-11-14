@@ -1275,6 +1275,10 @@ impl ChildDevice {
     }
 }
 
+/// Sensor reports that found no listener, counted to name only the first few.
+static UNCLAIMED_SENSOR_REPORTS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 #[pin_data]
 struct AopData {
     dev: ARef<device::Device>,
@@ -1612,6 +1616,18 @@ impl AopData {
             if entry.svc.endpoint == ep.index && entry.svc.channel == ch {
                 return entry.listener.process_fakehid_report(data);
             }
+        }
+        drop(guard);
+        // A sensor report for no listener is dropped; name the first few, so
+        // that a service reporting on another channel than it announced shows.
+        if UNCLAIMED_SENSOR_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 4 {
+            dev_info!(
+                self.dev,
+                "sensor report for no listener: endpoint {:#04x} channel {}, {} bytes\n",
+                ep.index,
+                ch,
+                data.len()
+            );
         }
         Ok(())
     }
