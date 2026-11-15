@@ -77,7 +77,7 @@ static unsigned reports;
 
 STUBS = r'''
 struct atcphy_hw { enum atcphy_generation gen;
-    bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy, clear_boot_hold, usb2_only; };
+    bool has_t8140_dp, dp_t8122, dp_banked_tunables, has_usb4, park_pipe_unlocked, park_dummy_phy, clear_boot_hold, usb2_only; };
 struct device_node { const char *const *compatible; unsigned int count; };
 static bool of_device_is_compatible(const struct device_node *root, const char *compatible) {
     if (!root) return false;
@@ -432,6 +432,12 @@ static void target_mode_table_and_dirty(void) {
  hw.gen=ATCPHY_GENERATION_T8132;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB2);
  p.t8132_dp_alt=true;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_DP);
  hw.gen=ATCPHY_GENERATION_T8103;p.t8132_dp_alt=false;
+ /* T8142 without the loader's DP banks: the partner's USB, USB2 beside four lanes, USB3 beside two. */
+ hw.dp_banked_tunables=true;p.dp_tunables=false;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB2);
+ state.mode=TYPEC_DP_STATE_D;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB3);
+ p.dp_tunables=true;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB3_DP);
+ state.mode=TYPEC_DP_STATE_C;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_DP);
+ hw.dp_banked_tunables=false;p.dp_tunables=false;
  p.mode=APPLE_ATCPHY_MODE_USB3;p.mode_dirty=true;assert(atcphy_usb3_route(&p,true)==-EBUSY);assert(!muxes&&!configure_calls);
  p.mode_dirty=false;p.usb_off_pending=true;assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==-EBUSY);
 }
