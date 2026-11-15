@@ -374,6 +374,14 @@ def check(root, output):
             queued=queued.replace('void *dev;int fw_compat;','void *dev;int fw_compat;void *afk_alloc;',1)
             queued=queued.replace('    #define FIELD_PREP(mask,val)',
                                   '    #ifndef DCP_FIRMWARE_M4\n    #define DCP_FIRMWARE_M4 (DCP_FIRMWARE_H17P + 4)\n    #endif\n    #define FIELD_PREP(mask,val)',1)
+        if 'dcp_av_audio_endpoint(' in extract(af,'static bool afk_compact_capable('):
+            # Nor its audio endpoint: the per-profile one (T8142's dcpav-interface-ep).
+            from common import internal_inline
+            assert queued.count('unsigned int num_dptx_ports; } hw;')==1
+            queued=queued.replace('unsigned int num_dptx_ports; } hw;',
+                                  'unsigned int num_dptx_ports;u32 av_audio_endpoint; } hw;',1)
+            queued=queued.replace('    #define FIELD_PREP(mask,val)',
+                                  internal_inline(root,'dcp_av_audio_endpoint')+'    #define FIELD_PREP(mask,val)',1)
     for signature in ['static inline unsigned int afk_ring_drain_budget(', 'static inline unsigned int afk_ring_drain(']:
         queued+=extract(afh,signature)+'\n'
     for signature in ['static bool afk_recv_entry(', 'static void afk_recv_drain(',
