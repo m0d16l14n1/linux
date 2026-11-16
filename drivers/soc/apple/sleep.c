@@ -6979,10 +6979,25 @@ static void t8142_lower_io(struct apple_sleep *s)
 static void t8142_commit_note(struct apple_sleep *s)
 {
 	u8 flags = 0, src = 0xff;
+	u32 sep, aon = 0;
 	int i;
 
 	if (!sleep_notes_on(s))
 		return;
+
+	/*
+	 * TEST: preserve SEP's gate and the forced-on AON states across WD2.
+	 * PMU 0x8310..13: SEP PS; 0x8314..17: actual-state nibbles in
+	 * ps_aon_macos_on order. Before the complex writes and their 33 ms limit.
+	 */
+	sep = readl(s->ps + s->soc->ps.sep);
+	for (i = 0; i < s->soc->ps_aon_macos_on.count && i < 8; i++)
+		aon |= FIELD_GET(PS_ACTUAL,
+				 readl(s->ps_aon + s->soc->ps_aon_macos_on.offset[i])) << (4 * i);
+	for (i = 0; i < 4; i++) {
+		sleep_note_at(s, 8 + i, sep >> (8 * i));
+		sleep_note_at(s, 12 + i, aon >> (8 * i));
+	}
 	if (s->cpus_stop_ret)
 		flags |= 0x01;
 	if (s->perf_soc_ret)
