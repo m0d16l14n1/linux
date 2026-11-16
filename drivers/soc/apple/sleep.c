@@ -1818,8 +1818,28 @@ static void sleep_deep_wfi_arm(void)
 }
 
 /* A core's last instructions: nothing brings it back but a reset. */
+/*
+ * TEST (J813): nothing may end the last WFI. With interrupts masked a pending FIQ only makes
+ * WFI return, and a core that keeps returning never powers down: the EL2 timers (VHE), the
+ * EL1 timers the KVM-enabled AIC routes as FIQs, and the PMU's FIQ modes off, as aura's
+ * tracer stops its own EL2 timers before the S2R timer.
+ */
+static void sleep_quiet_cpu(void)
+{
+	write_sysreg(0, cntp_ctl_el0);
+	write_sysreg(0, cntv_ctl_el0);
+	if (is_kernel_in_hyp_mode()) {
+		write_sysreg_s(0, SYS_CNTP_CTL_EL02);
+		write_sysreg_s(0, SYS_CNTV_CTL_EL02);
+	}
+	sysreg_clear_set_s(sys_reg(3, 1, 15, 0, 0), GENMASK(10, 8), 0);	/* PMCR0 IMODE off */
+	sysreg_clear_set_s(sys_reg(3, 7, 15, 0, 4), GENMASK(18, 16), 0);	/* UPMCR0 IMODE off */
+	isb();
+}
+
 static void __noreturn sleep_deep_wfi(void)
 {
+	sleep_quiet_cpu();
 	sleep_deep_wfi_arm();
 
 	while (true) {
@@ -4260,6 +4280,9 @@ static void apple_sleep_dcs_down(struct apple_sleep *s)
 /* The boot core's last WFI. An event that ends it is taken, and the WFI taken again. */
 static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 {
+	unsigned long exits = 0;
+
+	sleep_quiet_cpu();
 	sleep_deep_wfi_arm();
 
 	while (true) {
@@ -4268,6 +4291,11 @@ static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 		wfi();
 		s->soc->ops->aic_ack();
 		write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
+		/* TEST: a WFI that keeps returning says why, once (ISR_EL1 at +4) */
+		if (++exits == 100000) {
+			sleep_note_at(s, 4, (u8)read_sysreg(isr_el1));
+			sleep_note(s, 0x6f);
+		}
 	}
 }
 
