@@ -7014,6 +7014,10 @@ static void t8142_lower_io(struct apple_sleep *s)
 		apple_sleep_lower_apcie(s);
 		s->ans_off_ret = sleep_ps_wait_off(s, s->soc->ps.ans);
 	}
+	/* PMP's callback has idled the firmware and saved SRAM; RUN is clear. */
+	sleep_ps_lower(s, 0x598);
+	if (sleep_ps_wait_off(s, 0x598))
+		dev_warn(s->dev, "PMP power domain did not turn off\n");
 	sleep_note(s, 0x63);
 }
 
@@ -7026,11 +7030,28 @@ static void t8142_lower_io(struct apple_sleep *s)
  */
 static void t8142_commit_note(struct apple_sleep *s)
 {
+	static const u32 test_aon_words[] = {
+		0x40e0, 0x40e8, 0x4118, 0x4138, 0x4148, 0x4150, 0x4158,
+	};
 	u8 flags = 0, src = 0xff;
+	u32 sep, aon = 0;
 	int i;
 
 	if (!sleep_notes_on(s))
 		return;
+
+	/*
+	 * TEST: preserve SEP's gate and the formerly forced-on AON states across WD2.
+	 * PMU 0x8310..13: SEP PS; 0x8314..17: actual-state nibbles in
+	 * test_aon_words order. Before the complex writes and their 33 ms limit.
+	 */
+	sep = readl(s->ps + s->soc->ps.sep);
+	for (i = 0; i < ARRAY_SIZE(test_aon_words); i++)
+		aon |= FIELD_GET(PS_ACTUAL, readl(s->ps_aon + test_aon_words[i])) << (4 * i);
+	for (i = 0; i < 4; i++) {
+		sleep_note_at(s, 8 + i, sep >> (8 * i));
+		sleep_note_at(s, 12 + i, aon >> (8 * i));
+	}
 	if (s->cpus_stop_ret)
 		flags |= 0x01;
 	if (s->perf_soc_ret)
@@ -7449,9 +7470,11 @@ static const u32 t8142_ps_aon_macos_off[] = {
 	0xe0, 0xd8,
 };
 
-static const u32 t8142_ps_aon_macos_on[] = {
-	0x40e0, 0x40e8, 0x4118, 0x4138, 0x4148, 0x4150, 0x4158,
-};
+/*
+ * T8142 has no ps_aon_macos_on list. These audio domains are no_ps in its
+ * ADT and remain at actual/target zero in the J813 macOS sleep snapshot;
+ * the traced AP never accesses them. The T8132 state-4 rule does not apply.
+ */
 
 /*
  * T8132's quiesce words by name: the ATC commons, the display's and DISPEXT's SYS, ANS, AVD,
@@ -7583,7 +7606,6 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ps_aon_all = SLEEP_WORDS(t8142_ps_aon_all),
 	.ps_macos_off = SLEEP_WORDS(t8142_ps_macos_off),
 	.ps_aon_macos_off = SLEEP_WORDS(t8142_ps_aon_macos_off),
-	.ps_aon_macos_on = SLEEP_WORDS(t8142_ps_aon_macos_on),
 	.ps_wake_order = SLEEP_WORDS(t8142_ps_wake_order),
 	.ps_aon_wake_order = SLEEP_WORDS(t8142_ps_aon_wake_order),
 	.quiesce = SLEEP_WORDS(t8142_quiesce_words),
