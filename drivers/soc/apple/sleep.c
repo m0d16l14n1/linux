@@ -4342,19 +4342,21 @@ static int apple_sleep_commit(unsigned long unused)
 	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
 	s->soc->ops->aic_mask_all();
 	/* Optional: a SoC's own traffic after the timer, every line masked, finished before the release */
-	if (s->soc->ops->post_timer)
-		s->soc->ops->post_timer(s);
-	/* TEST: SPMI after the PMU's commands, to see how far a sleep that resets got */
-	sleep_note_at(s, 2, (u8)t8142_post_ret_peek());
+	/* TEST: 0x68 = the alarm was read before the commit (detail at +4) */
 	sleep_note_at(s, 4, t8142_alarm_ok_peek());
 	sleep_note(s, 0x68);
+	if (s->soc->ops->post_timer)
+		s->soc->ops->post_timer(s);
+	/* TEST: only a failed post-timer step leaves a note after the PMU's go (0x6e, ret at +2) */
+	if (t8142_post_ret_peek()) {
+		sleep_note_at(s, 2, (u8)t8142_post_ret_peek());
+		sleep_note(s, 0x6e);
+	}
 
 	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
 	spin_table_release_stopped();
-	sleep_note(s, 0x69);
 	if (s->soc->boot_wfi_delay_ms)
 		mdelay(s->soc->boot_wfi_delay_ms);
-	sleep_note(s, 0x6a);
 	sleep_boot_wfi(s);
 }
 
