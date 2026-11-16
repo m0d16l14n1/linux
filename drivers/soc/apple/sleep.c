@@ -1818,8 +1818,28 @@ static void sleep_deep_wfi_arm(void)
 }
 
 /* A core's last instructions: nothing brings it back but a reset. */
+/*
+ * TEST (J813): nothing may end the last WFI. With interrupts masked a pending FIQ only makes
+ * WFI return, and a core that keeps returning never powers down: the EL2 timers (VHE), the
+ * EL1 timers the KVM-enabled AIC routes as FIQs, and the PMU's FIQ modes off, as aura's
+ * tracer stops its own EL2 timers before the S2R timer.
+ */
+static void sleep_quiet_cpu(void)
+{
+	write_sysreg(0, cntp_ctl_el0);
+	write_sysreg(0, cntv_ctl_el0);
+	if (is_kernel_in_hyp_mode()) {
+		write_sysreg_s(0, SYS_CNTP_CTL_EL02);
+		write_sysreg_s(0, SYS_CNTV_CTL_EL02);
+	}
+	sysreg_clear_set_s(sys_reg(3, 1, 15, 0, 0), GENMASK(10, 8), 0);	/* PMCR0 IMODE off */
+	sysreg_clear_set_s(sys_reg(3, 7, 15, 0, 4), GENMASK(18, 16), 0);	/* UPMCR0 IMODE off */
+	isb();
+}
+
 static void __noreturn sleep_deep_wfi(void)
 {
+	sleep_quiet_cpu();
 	sleep_deep_wfi_arm();
 
 	while (true) {
@@ -4260,6 +4280,9 @@ static void apple_sleep_dcs_down(struct apple_sleep *s)
 /* The boot core's last WFI. An event that ends it is taken, and the WFI taken again. */
 static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 {
+	unsigned long exits = 0;
+
+	sleep_quiet_cpu();
 	sleep_deep_wfi_arm();
 
 	while (true) {
@@ -4268,6 +4291,11 @@ static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 		wfi();
 		s->soc->ops->aic_ack();
 		write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
+		/* TEST: a WFI that keeps returning says why, once (ISR_EL1 at +4) */
+		if (++exits == 100000) {
+			sleep_note_at(s, 4, (u8)read_sysreg(isr_el1));
+			sleep_note(s, 0x6f);
+		}
 	}
 }
 
@@ -4293,6 +4321,8 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
  *    before this, with no SPMI traffic near the engine.
  */
 static bool sleep_v27_selected_for(struct apple_sleep *s);
+static int t8142_post_ret_peek(void);
+static u8 t8142_alarm_ok_peek(void);
 
 static int apple_sleep_commit(unsigned long unused)
 {
@@ -4334,13 +4364,22 @@ static int apple_sleep_commit(unsigned long unused)
 		s->soc->ops->pre_commit(s);
 	dsb(sy);
 
+	sleep_note(s, 0x67);	/* TEST: the commit write is next */
 	writel(1, s->commit);
 
 	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
 	s->soc->ops->aic_mask_all();
 	/* Optional: a SoC's own traffic after the timer, every line masked, finished before the release */
+	/* TEST: 0x68 = the alarm was read before the commit (detail at +4) */
+	sleep_note_at(s, 4, t8142_alarm_ok_peek());
+	sleep_note(s, 0x68);
 	if (s->soc->ops->post_timer)
 		s->soc->ops->post_timer(s);
+	/* TEST: only a failed post-timer step leaves a note after the PMU's go (0x6e, ret at +2) */
+	if (t8142_post_ret_peek()) {
+		sleep_note_at(s, 2, (u8)t8142_post_ret_peek());
+		sleep_note(s, 0x6e);
+	}
 
 	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
 	spin_table_release_stopped();
@@ -4604,6 +4643,8 @@ static void t8132_pre_commit(struct apple_sleep *s)
 static void apple_sleep_return(struct apple_sleep *s)
 {
 	int i;
+
+	sleep_note(s, 0x70);	/* TEST: back in the kernel after the commit */
 
 	/*
 	 * The reset leaves the timer control at its EL2 default, without the event stream
@@ -6922,9 +6963,16 @@ static int t8142_perf_request(void __iomem *reg, unsigned int state)
  * to 3, through 5 from 6..10. macOS waits on BUSY with no limit and panics on a DCS state
  * above 10; here each wait is bounded, and such a state is left alone.
  */
+/* TEST: macOS's AP never writes these words in a sleep (J813 traces, 2026-11-16). */
+static bool t8142_perf;
+module_param(t8142_perf, bool, 0644);
+
 static void t8142_perf_down(struct apple_sleep *s)
 {
 	unsigned int state = FIELD_GET(DCS_STATE, readl(s->dcs));
+
+	if (!READ_ONCE(t8142_perf))
+		return;
 
 	s->perf_dcs_from = state;
 	s->perf_soc_ret = t8142_perf_request(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE);
@@ -7008,6 +7056,91 @@ static void t8142_commit_note(struct apple_sleep *s)
 	sleep_note_at(s, 2, flags);
 	sleep_note_at(s, 4, src);
 	sleep_note(s, 0x65);
+}
+
+/*
+ * The PMU's RTC alarm after the S2R timer, as macOS 27.2 sends it on the J813 (traced
+ * 2026-11-16, run g01: 0.11 to 0.25 ms after the timer, boot core): read RTC_CTL (0x41),
+ * the 4-byte compare at 0x2008, 0x200e <- 0, RTC_CTL <- 0x41; 0x43 first if it had fired.
+ * The same registers and order as T6050's post-timer step (apple,pmu-alarm-rearm 0x43 0x41).
+ * Without it the SoC never goes down after the timer and WD2 resets it (J813, PMU note 0x67).
+ * TEST: the compare is now + apple_sleep.t8142_wake_s (0: macOS's own compare as found).
+ */
+static unsigned int t8142_wake_s = 30;
+module_param(t8142_wake_s, uint, 0644);
+MODULE_PARM_DESC(t8142_wake_s, "T8142 TEST: PMU RTC alarm this many s after the commit (0: keep the PMU's)");
+static u8 t8142_alarm[4];
+static bool t8142_alarm_ok;
+static int t8142_post_ret = -ENODATA;
+static u64 t8142_alarm_counter;
+
+/* The opcode carries the byte count, as t6050_sleep_pmu_xfer() builds it (macOS: 0x33 for 4). */
+static int t8142_pmu(struct apple_sleep *s, u32 mask, u8 opcode, u16 address, const u8 *wr, u8 *rd,
+		     unsigned int len)
+{
+	return t6050_sleep_pmu_xfer_post(s, mask, opcode | (len - 1), address, wr, rd, len);
+}
+
+static int t8142_post_ret_peek(void)
+{
+	return t8142_post_ret;
+}
+
+static u8 t8142_alarm_ok_peek(void)
+{
+	return t8142_alarm_ok;
+}
+
+static void t8142_pre_commit(struct apple_sleep *s)
+{
+	u32 mask = s->soc->spmi_notify_sleep;
+	u8 ticks[8] = {};
+
+	t8142_alarm_ok = false;
+	t8142_post_ret = -ENODATA;
+	if (s->spmi) {
+		t6050_sleep_pmu_drain(s);
+		if (!t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE,
+					       NULL, t8142_alarm, 4) &&
+		    !t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER,
+					       NULL, ticks, 6)) {
+			t8142_alarm_counter = get_unaligned_le64(ticks) >> 16;
+			if (t8142_wake_s)
+				put_unaligned_le32(t8142_alarm_counter + t8142_wake_s, t8142_alarm);
+			t8142_alarm_ok = true;
+		}
+	}
+	t8132_pre_commit(s);
+}
+
+static void t8142_post_timer(struct apple_sleep *s)
+{
+	u32 mask = s->soc->spmi_notify_sleep & ~M5_SPMI_IRQ_DONE;
+	u8 ctl = 0, v;
+	int ret;
+
+	if (!t8142_alarm_ok)
+		return;
+	ret = t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1);
+	if (!ret && (ctl & T6050_RTC_CTL_FIRED)) {
+		v = 0x43;
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
+						NULL, 1);
+	}
+	if (!ret)
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_COMPARE,
+						t8142_alarm, NULL, 4);
+	if (!ret) {
+		v = 0;
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_MASK, &v,
+						NULL, 1);
+	}
+	if (!ret) {
+		v = 0x41;
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
+						NULL, 1);
+	}
+	t8142_post_ret = ret;
 }
 
 /*
@@ -7158,6 +7291,9 @@ static void t8142_wake(struct apple_sleep *s)
 	const struct apple_sleep_soc *soc = s->soc;
 	u32 val;
 	int i;
+
+	pr_info("apple-sleep: T8142 PMU alarm after the timer: %d (counter %llu, compare %u)\n",
+		t8142_post_ret, t8142_alarm_counter, get_unaligned_le32(t8142_alarm));
 
 	s->cluster_e_ret = t8142_cluster_on(s, soc->cluster_cpu[0], s->acc_e);
 	s->cluster_p_ret = t8142_cluster_on(s, soc->cluster_cpu[1], s->acc_p);
@@ -7354,7 +7490,8 @@ static const struct apple_sleep_ops t8142_sleep_ops = {
 	.last_mile = t8142_last_mile,
 	/* WD2 is at T8132's address (/arm-io/wdt), so the same stub restarts it. */
 	.resume = t8132_resume_stub,
-	.pre_commit = t8132_pre_commit,
+	.pre_commit = t8142_pre_commit,
+	.post_timer = t8142_post_timer,
 	.wake = t8142_wake,
 	.aic_mask_all = aic_sleep_mask_all,
 	.aic_ack = aic_sleep_ack,
