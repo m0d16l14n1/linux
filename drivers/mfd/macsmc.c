@@ -133,16 +133,22 @@ static const struct apple_smc_hw apple_smc_t6041_hw = {
  * T8142 (J813/J815). macOS 27.2.1 (26B131) on J815, traced: MBSE = slpw 478.6 ms before the
  * S2R timer, ahead of the displays; pmVC 175 ms later; after the GPU, SEP, ANS, SIO and PMP
  * sleeps MBSE = slpa (44.2 ms), the AP idle notice 3.0 ms after it, and 41.2 ms to the timer.
- * Here the whole sequence is the last stop, so the warning is sent where the commit is, behind
- * every refusal, as on T6041, with macOS's 434 ms from it to slpa. pmVC is left out: its value
- * is in the SMC's shared memory, which the trace doesn't have. No WKTP: not in the trace.
+ * Those gaps were stretched by the tracer's trapping on two CPUs. The same entry on a J813 at
+ * native speed on all ten cores (gig3m, trace s12, gist 27bacd79) has slpw 200.0 ms, pmVC
+ * 161.6 ms, slpa 7.6 ms and the notice 6.8 ms before the timer: slpw to slpa 192 ms, slpa to the
+ * notice 0.85 ms, and the 6.8 ms after the notice are macOS's own last steps (cores, storage,
+ * WD2, memory side, last mile), not a wait. Here the whole sequence is the last stop, so the
+ * warning is sent where the commit is, behind every refusal, as on T6041, 192 ms ahead of slpa;
+ * 1 ms (0 is the default) after slpa and after the notice. Traced J815 values: 434/3/41.
+ * pmVC is left out: its value is in the SMC's shared memory, which the trace doesn't have. No
+ * WKTP: not in either trace.
  */
 static const struct apple_smc_hw apple_smc_t8142_hw = {
 	.commit_at_stop = true,
 	.stop_last = true,
-	.warn_ms = 434,
-	.arm_ms = 3,
-	.idle_ms = 41,
+	.warn_ms = 192,
+	.arm_ms = 1,
+	.idle_ms = 1,
 };
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
