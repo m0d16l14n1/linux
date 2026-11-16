@@ -146,6 +146,10 @@ struct apple_smc {
 	bool commit_at_stop;
 	/* Its gaps there in ms: the warning to slpa, slpa to the idle notice, after the notice */
 	unsigned int stop_warn_ms, stop_arm_ms, stop_idle_ms;
+	/* pmVC at the last stop, that many ms after slpw (0: none), and after waka */
+	u32 stop_pmvc, wake_pmvc;
+	unsigned int stop_pmvc_ms, wake_pmvc_ms;
+	bool pmvc_sent;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
 	/* MBSW's bits as this SoC numbers them, from the probe. */

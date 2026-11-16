@@ -122,6 +122,12 @@ struct apple_smc_hw {
 	 */
 	bool stop_last;
 	u16 warn_ms, arm_ms, idle_ms;
+	/*
+	 * pmVC without a sleep policy: @pmvc_sleep @pmvc_sleep_ms after slpw, within warn_ms,
+	 * and @pmvc_wake @pmvc_wake_ms after waka (0: not sent).
+	 */
+	u32 pmvc_sleep, pmvc_wake;
+	u16 pmvc_sleep_ms, pmvc_wake_ms;
 };
 
 static const struct apple_smc_hw apple_smc_t6041_hw = {
@@ -140,8 +146,10 @@ static const struct apple_smc_hw apple_smc_t6041_hw = {
  * WD2, memory side, last mile), not a wait. Here the whole sequence is the last stop, so the
  * warning is sent where the commit is, behind every refusal, as on T6041, 192 ms ahead of slpa;
  * 1 ms (0 is the default) after slpa and after the notice. Traced J815 values: 434/3/41.
- * pmVC is left out: its value is in the SMC's shared memory, which the trace doesn't have. No
- * WKTP: not in either trace.
+ * pmVC: gig3m's J813 trace with the SMC's SRAM hooked (f6, gist 89aedeca, 2026-11-16) has
+ * pmVC = 0x101 (KEY_INFO, then the write) 165 ms before the commit, 40 ms after slpw and before
+ * slpa, and pmVC = 0x100 15 ms after waka (23.8 ms and 38.9 ms into the wake). No WKTP: not in
+ * either trace. macsmc.m5_pmvc=0 leaves pmVC out, as before.
  */
 static const struct apple_smc_hw apple_smc_t8142_hw = {
 	.commit_at_stop = true,
@@ -149,7 +157,15 @@ static const struct apple_smc_hw apple_smc_t8142_hw = {
 	.warn_ms = 192,
 	.arm_ms = 1,
 	.idle_ms = 1,
+	.pmvc_sleep = 0x101,
+	.pmvc_wake = 0x100,
+	.pmvc_sleep_ms = 40,
+	.pmvc_wake_ms = 15,
 };
+
+static bool smc_m5_pmvc = true;
+module_param_named(m5_pmvc, smc_m5_pmvc, bool, 0644);
+MODULE_PARM_DESC(m5_pmvc, "T8142: send pmVC at the sleep (0x101) and after the wake (0x100), as macOS does (default Y)");
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
 					   size_t count)
@@ -825,6 +841,12 @@ static int apple_smc_probe(struct platform_device *pdev)
 		smc->stop_warn_ms = hw->warn_ms ?: SMC_SLEEP_WARN_MS;
 		smc->stop_arm_ms = hw->arm_ms ?: SMC_SLEEP_ARM_MS;
 		smc->stop_idle_ms = hw->idle_ms ?: SMC_SLEEP_IDLE_MS;
+		if (hw->pmvc_sleep_ms && hw->pmvc_sleep_ms < smc->stop_warn_ms) {
+			smc->stop_pmvc = hw->pmvc_sleep;
+			smc->stop_pmvc_ms = hw->pmvc_sleep_ms;
+			smc->wake_pmvc = hw->pmvc_wake;
+			smc->wake_pmvc_ms = hw->pmvc_wake_ms;
+		}
 		ret = devm_add_action_or_reset(dev, apple_smc_last_stop_unregister, smc);
 		if (ret)
 			return ret;
@@ -1267,6 +1289,20 @@ static bool apple_smc_port_reasons_only(const struct apple_smc *smc, u64 record)
 
 static void apple_smc_sleep_wait(u64 acknowledged, u32 minimum_us);
 
+/* After waka, the pmVC the last stop sent taken back (T8142: 0x100, 15 ms later). */
+static void apple_smc_wake_pmvc(struct apple_smc *smc)
+{
+	int ret;
+
+	if (!smc->pmvc_sent)
+		return;
+	smc->pmvc_sent = false;
+	apple_smc_sleep_wait(__arch_counter_get_cntpct(), smc->wake_pmvc_ms * USEC_PER_MSEC);
+	ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), smc->wake_pmvc);
+	if (ret)
+		dev_warn(smc->dev, "pmVC = %#x after waka failed: %d\n", smc->wake_pmvc, ret);
+}
+
 static void apple_smc_sleep_wake(struct apple_smc *smc)
 {
 	bool mbsw;
@@ -1292,6 +1328,7 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 		}
 	} else {
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
+		apple_smc_wake_pmvc(smc);
 	}
 	smc->sleep_warned = false;
 	if (smc->sleep_policy)
@@ -1747,6 +1784,7 @@ static void apple_smc_sleep_end(struct apple_smc *smc)
 			}
 		} else {
 			apple_smc_write_mbse(smc, SMC_KEY(waka));
+			apple_smc_wake_pmvc(smc);
 		}
 		smc->sleep_warned = false;
 	}
@@ -1862,7 +1900,20 @@ static int apple_smc_last_stop(void *data)
 	smc->sleep_warned = true;
 	if (apple_smc_stop_dead(err))
 		goto dead;
-	apple_smc_outbox_poll(smc, "sleep warning at the last stop", smc->stop_warn_ms, 0);
+	if (smc->stop_pmvc_ms && READ_ONCE(smc_m5_pmvc)) {
+		/* macOS's pmVC, between slpw and slpa; the warning's gap stays the same overall. */
+		apple_smc_outbox_poll(smc, "sleep warning at the last stop", smc->stop_pmvc_ms, 0);
+		ret = apple_smc_stop_write(smc, SMC_KEY(pmVC), &smc->stop_pmvc,
+					   sizeof(smc->stop_pmvc));
+		if (apple_smc_stop_dead(ret))
+			goto dead;
+		/* Taken back after waka even if the SMC said no: the request may have landed. */
+		smc->pmvc_sent = true;
+		apple_smc_outbox_poll(smc, "pmVC at the last stop",
+				      smc->stop_warn_ms - smc->stop_pmvc_ms, 0);
+	} else {
+		apple_smc_outbox_poll(smc, "sleep warning at the last stop", smc->stop_warn_ms, 0);
+	}
 
 	/* As in apple_smc_sleep_commit(). */
 	smc->wake_silent = true;
