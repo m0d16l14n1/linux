@@ -4334,6 +4334,7 @@ static int apple_sleep_commit(unsigned long unused)
 		s->soc->ops->pre_commit(s);
 	dsb(sy);
 
+	sleep_note(s, 0x67);	/* TEST: the commit write is next */
 	writel(1, s->commit);
 
 	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
@@ -4604,6 +4605,8 @@ static void t8132_pre_commit(struct apple_sleep *s)
 static void apple_sleep_return(struct apple_sleep *s)
 {
 	int i;
+
+	sleep_note(s, 0x70);	/* TEST: back in the kernel after the commit */
 
 	/*
 	 * The reset leaves the timer control at its EL2 default, without the event stream
@@ -6922,9 +6925,16 @@ static int t8142_perf_request(void __iomem *reg, unsigned int state)
  * to 3, through 5 from 6..10. macOS waits on BUSY with no limit and panics on a DCS state
  * above 10; here each wait is bounded, and such a state is left alone.
  */
+/* TEST: macOS's AP never writes these words in a sleep (J813 traces, 2026-11-16). */
+static bool t8142_perf;
+module_param(t8142_perf, bool, 0644);
+
 static void t8142_perf_down(struct apple_sleep *s)
 {
 	unsigned int state = FIELD_GET(DCS_STATE, readl(s->dcs));
+
+	if (!READ_ONCE(t8142_perf))
+		return;
 
 	s->perf_dcs_from = state;
 	s->perf_soc_ret = t8142_perf_request(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE);
