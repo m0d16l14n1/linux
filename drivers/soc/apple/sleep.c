@@ -83,6 +83,8 @@
 #include <linux/soc/apple/tunable.h>
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/pci.h>
 #include <linux/workqueue.h>
 #include <clocksource/arm_arch_timer.h>
 #include <asm/apple-idle.h>
@@ -914,6 +916,13 @@ struct apple_sleep {
 	/* The radio's port stop at the commit (sleep_radio_port_stop()), and its first timeout */
 	int radio_stop_ret;
 	const char *radio_stop_step;
+	/* The port's MSI setup (pcie-apple-msi writes it once, at probe), saved at the stop */
+	bool radio_msi_saved;
+	u32 radio_msi_cfg, radio_msi_addr, radio_msimap[32];
+	/* apple_sleep.radio_cold: the N1's functions removed for this sleep, restarted after it */
+	bool radio_parked;
+	struct pci_dev *radio_root;
+	struct work_struct radio_work;
 };
 
 static struct apple_sleep *apple_sleep;
@@ -3649,6 +3658,10 @@ static int apple_sleep_raise_apcie_gen4(struct apple_sleep *s)
 #define RADIO_PORT_APPCLK	0x800
 #define RADIO_PORT_STATUS	0x804
 #define RADIO_PORT_PERST	0x82c
+/* pcie-apple-msi's registers (PORT_MSICFG, PORT_MSIADDR, PORT_MSIMAP) */
+#define RADIO_PORT_MSICFG	0x124
+#define RADIO_PORT_MSIADDR	0x16c
+#define RADIO_PORT_MSIMAP	0x3800
 #define RADIO_LANE_REQ0		BIT(0)
 #define RADIO_LANE_REQ1		BIT(1)
 #define RADIO_LANE_ACK0		BIT(2)
@@ -3750,6 +3763,16 @@ static int apple_sleep_radio_train(struct apple_sleep *s)
 
 	/* The root port's buses as the loader set them; the PCI core restores the rest. */
 	writel(0x00010100, cfg + RADIO_CFG_BUSES);
+	/*
+	 * The port reset above clears the MSI address and enable, and the power loss the map:
+	 * pcie-apple-msi programs them only at its probe, so without this no N1 vector fires.
+	 */
+	if (s->radio_msi_saved) {
+		for (i = 0; i < ARRAY_SIZE(s->radio_msimap); i++)
+			writel(s->radio_msimap[i], port + RADIO_PORT_MSIMAP + 4 * i);
+		writel(s->radio_msi_addr, port + RADIO_PORT_MSIADDR);
+		writel(s->radio_msi_cfg, port + RADIO_PORT_MSICFG);
+	}
 	/* PCIe's 100 ms from PERST# release to the first configuration request */
 	mdelay(100);
 
@@ -3802,6 +3825,17 @@ static int sleep_radio_port_stop(struct apple_sleep *s)
 	void __iomem *perst = port + RADIO_PORT_PERST;
 	u32 val;
 	int ret = 0, err;
+
+	/* The MSI setup goes with the block's power: apple_sleep_radio_train() writes it back. */
+	if (readl(port + RADIO_PORT_MSIADDR)) {
+		unsigned int i;
+
+		s->radio_msi_cfg = readl(port + RADIO_PORT_MSICFG);
+		s->radio_msi_addr = readl(port + RADIO_PORT_MSIADDR);
+		for (i = 0; i < ARRAY_SIZE(s->radio_msimap); i++)
+			s->radio_msimap[i] = readl(port + RADIO_PORT_MSIMAP + 4 * i);
+		s->radio_msi_saved = true;
+	}
 
 	/* A port the loader never brought up has no link to stop. */
 	if (!(readl(port + RADIO_PORT_STATUS) & BIT(0))) {
@@ -6943,6 +6977,166 @@ static void apple_sleep_map_radio(struct apple_sleep *s)
 		dev_info(s->dev, "the radio's port can't be trained after a sleep: a real sleep is refused while its host is bound\n");
 }
 
+/*
+ * apple_sleep.radio_cold (default Y). After a real sleep the N1's firmware doesn't run any
+ * more (J815 boot 01ac48cb: Beta exec 3 ipc 2, every Wi-Fi scan -EIO), and the generic
+ * drivers only keep a running one across a sleep (centauri_suspend()). So for a deep sleep
+ * its functions are removed first, in the order an unbind of its host takes, and after the
+ * resume it starts as at boot: its port stopped if the sleep never got to it, the N1 held in
+ * PERST# and reset by the SMC (gP13 low, then high, 50 ms each: the ADT's pci-bridge0
+ * function-reset, as aura's j813_n1.c), its port trained, its bus scanned again. Its driver
+ * then boots the ROM image, cycles the port and brings up functions 1 and 2 (Bluetooth).
+ * Dry runs (mem_sleep deep, no commit) take the same path.
+ */
+static bool sleep_radio_cold = true;
+module_param_named(radio_cold, sleep_radio_cold, bool, 0644);
+MODULE_PARM_DESC(radio_cold, "Remove the N1's PCI functions for a deep sleep and start it from ROM after the resume (default Y)");
+
+#define RADIO_SMC_GP13		0x67503133	/* 'gP13' */
+#define RADIO_SMC_RESET		0x800000
+
+/* The radio host's root port, referenced */
+static struct pci_dev *sleep_radio_root(struct apple_sleep *s)
+{
+	struct pci_dev *pdev = NULL;
+
+	for_each_pci_dev(pdev) {
+		struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+
+		if (pci_is_pcie(pdev) && pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT &&
+		    pdev->subordinate && bridge && bridge->dev.parent &&
+		    bridge->dev.parent->of_node == s->radio_host_np)
+			return pdev;
+	}
+	return NULL;
+}
+
+static int sleep_radio_smc_reset(struct apple_sleep *s)
+{
+#if IS_REACHABLE(CONFIG_MFD_MACSMC)
+	struct device_node *np = of_find_compatible_node(NULL, NULL, "apple,t8103-smc");
+	struct platform_device *pdev = np ? of_find_device_by_node(np) : NULL;
+	struct apple_smc *smc;
+	unsigned int level;
+	int ret = -ENODEV;
+
+	of_node_put(np);
+	if (!pdev)
+		return -ENODEV;
+	device_lock(&pdev->dev);
+	smc = pdev->dev.driver ? dev_get_drvdata(&pdev->dev) : NULL;
+	for (level = 0; smc && level < 2; level++) {
+		ret = apple_smc_write_u32(smc, RADIO_SMC_GP13, RADIO_SMC_RESET | level);
+		if (ret)
+			break;
+		msleep(50);
+	}
+	device_unlock(&pdev->dev);
+	put_device(&pdev->dev);
+	return ret;
+#else
+	return -ENODEV;
+#endif
+}
+
+static void sleep_radio_cold_work(struct work_struct *work)
+{
+	struct apple_sleep *s = container_of(work, struct apple_sleep, radio_work);
+	const struct apple_sleep_domains *d = &s->soc->ps;
+	struct pci_dev *root = s->radio_root;
+	const char *step = "shared block off";
+	int ret = -ENODEV, stop = 0;
+	bool locked = false;
+
+	if (!sleep_ps_on(s, d->apcie_gp) || !sleep_ps_on(s, d->apcie_sys_gp) ||
+	    !sleep_ps_on(s, d->apcie_st) || !sleep_ps_on(s, d->apcie_sys_st) ||
+	    !sleep_ps_on(s, d->apcie_phy_sw) || !sleep_ps_on(s, d->gpio))
+		goto out;
+	/*
+	 * The root port's config space is the port's: with the port stopped a read would hang.
+	 * Config reads from userspace wait here until the port is back; if it never comes back
+	 * they keep waiting, which beats an SError.
+	 */
+	pci_cfg_access_lock(root);
+	locked = true;
+	/* Up since the wake's train (apple_sleep_radio_train()), or a dry run's link */
+	if (readl(s->radio_port + RADIO_PORT_STATUS) & BIT(0)) {
+		s->radio_stop_step = NULL;
+		stop = sleep_radio_port_stop(s);
+	}
+	sleep_radio_perst(s, true);
+	step = "SMC reset";
+	ret = sleep_radio_smc_reset(s);
+	if (ret)
+		goto out;
+	msleep(100);
+	step = "port train";
+	ret = apple_sleep_radio_train(s);
+	if (ret)
+		goto out;
+	pci_cfg_access_unlock(root);
+	locked = false;
+	step = "rescan";
+	pci_lock_rescan_remove();
+	pci_rescan_bus(root->subordinate);
+	ret = list_empty(&root->subordinate->devices) ? -ENODEV : 0;
+	pci_unlock_rescan_remove();
+out:
+	if (ret)
+		dev_err(s->dev, "radio: N1 restart after the sleep failed at %s: %d (port stop %d); Wi-Fi/BT stay off until a reboot%s\n",
+			step, ret, stop, locked ? ", the root port's config space stays locked" : "");
+	else
+		dev_info(s->dev, "radio: N1 reset and its link trained after the sleep (port stop %d), functions scanned again\n",
+			 stop);
+	s->radio_parked = false;
+	s->radio_root = NULL;
+	pci_dev_put(root);
+}
+
+static int apple_sleep_radio_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_sleep *s = READ_ONCE(apple_sleep);
+	struct pci_dev *root, *pdev, *tmp;
+	unsigned int n = 0;
+
+	if (!s || !s->radio_trainable)
+		return NOTIFY_DONE;
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		/* The previous restart first: its probe must not race this removal. */
+		flush_work(&s->radio_work);
+		if (!READ_ONCE(sleep_radio_cold) || mem_sleep_current != PM_SUSPEND_MEM)
+			break;
+		root = sleep_radio_root(s);
+		if (!root)
+			break;
+		pci_lock_rescan_remove();
+		list_for_each_entry_safe_reverse(pdev, tmp, &root->subordinate->devices, bus_list) {
+			pci_stop_and_remove_bus_device(pdev);
+			n++;
+		}
+		pci_unlock_rescan_remove();
+		if (!n) {
+			pci_dev_put(root);
+			break;
+		}
+		s->radio_root = root;
+		s->radio_parked = true;
+		dev_info(s->dev, "radio: %u N1 functions removed for the deep sleep\n", n);
+		break;
+	case PM_POST_SUSPEND:
+		if (s->radio_parked)
+			queue_work(system_long_wq, &s->radio_work);
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block apple_sleep_radio_nb = {
+	.notifier_call = apple_sleep_radio_notify,
+};
+
 static void apple_sleep_map_debug_port(struct apple_sleep *s)
 {
 	struct device_node *np = of_parse_phandle(s->dev->of_node, "apple,debug-port", 0);
@@ -7344,9 +7538,12 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	if (s->soc->pen_deep)
 		spin_table_pen_deep_arm(true);
 
+	INIT_WORK(&s->radio_work, sleep_radio_cold_work);
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	apple_sleep = s;
 	apple_sleep_registry_ready();
+	if (s->radio_trainable)
+		register_pm_notifier(&apple_sleep_radio_nb);
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(s->soc->early_context ? &apple_sleep_early_ops : &apple_sleep_ops);
 #ifdef CONFIG_HIBERNATION
@@ -8743,7 +8940,12 @@ static void t8142_wake(struct apple_sleep *s)
 
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
-	/* Before the PCI core restores the radio's functions, which needs the link. */
+	/*
+	 * Before the PCI core restores the radio's functions, which needs the link, and the root
+	 * port's own state, which needs the port up. With the functions removed for the sleep
+	 * (radio_cold) the N1 is then reset and trained once more after the resume
+	 * (sleep_radio_cold_work()).
+	 */
 	if (s->radio_trainable)
 		s->radio_train_ret = s->pcie_ans_stopped && !s->pcie_ans_on_ret ?
 				     apple_sleep_radio_train(s) : -ENOLINK;
