@@ -397,6 +397,17 @@ struct apple_sleep_extra_off {
 	u32 parent;
 };
 
+/*
+ * The match's lift: a ps_macos_off @child the boot left on with its parents off gets them
+ * raised first, @up[0] then @up[1], as genpd does when a driver attaches, so that it can go
+ * off as a child; the match then lowers all of them, the child first. 0 ends @up.
+ */
+#define SLEEP_PS_LIFT_MAX	4
+struct apple_sleep_ps_lift {
+	u32 child;
+	u32 up[2];
+};
+
 #define SLEEP_EXTRA_OFF_MAX	16
 
 struct apple_sleep_ops {
@@ -560,6 +571,8 @@ struct apple_sleep_soc {
 	struct apple_sleep_words ps_macos_on;
 	/* Off at macOS's commit, in the order it lowers them */
 	struct apple_sleep_words ps_macos_off;
+	const struct apple_sleep_ps_lift *ps_lift;
+	unsigned int nps_lift;
 	struct apple_sleep_words ps_aon_macos_off;
 	/* In "ps-aon": on at macOS's commit, with AUTO_ENABLE off */
 	struct apple_sleep_words ps_aon_macos_no_auto;
@@ -678,6 +691,8 @@ struct apple_sleep {
 	/* As the match found them: one for each word of the SoC's lists */
 	u32 *ps_on_saved;
 	u32 *ps_off_saved;
+	/* the match's lift: bit 2 * entry + n, up[n] raised */
+	u8 ps_lifted;
 	u32 *ps_aon_saved;
 	u32 *ps_aon_on_saved;
 	u32 *ps_aon_auto_saved;
@@ -4621,6 +4636,22 @@ static void apple_sleep_match(struct apple_sleep *s)
 			failed++;
 		raised++;
 	}
+	s->ps_lifted = 0;
+	for (i = 0; i < min(soc->nps_lift, (unsigned int)SLEEP_PS_LIFT_MAX); i++) {
+		const struct apple_sleep_ps_lift *l = &soc->ps_lift[i];
+		int n;
+
+		if (!sleep_ps_on(s, l->child))
+			continue;
+		for (n = 0; n < ARRAY_SIZE(l->up) && l->up[n]; n++) {
+			if (sleep_ps_on(s, l->up[n]))
+				continue;
+			if (sleep_ps_raise(s, l->up[n]))
+				failed++;
+			s->ps_lifted |= BIT(2 * i + n);
+			raised++;
+		}
+	}
 	for (i = 0; i < soc->ps_macos_off.count; i++) {
 		u32 offset = soc->ps_macos_off.offset[i];
 
@@ -4714,6 +4745,15 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
 		if (FIELD_GET(PS_ACTUAL, s->ps_off_saved[i]) &&
 		    !sleep_ps_kept(s, soc->ps_macos_off.offset[i], false))
 			sleep_ps_raise(s, soc->ps_macos_off.offset[i]);
+	/* What the lift raised goes back off, the last raised first: the boot's state again. */
+	for (i = min(soc->nps_lift, (unsigned int)SLEEP_PS_LIFT_MAX) - 1; i >= 0; i--) {
+		int n;
+
+		for (n = ARRAY_SIZE(soc->ps_lift[i].up) - 1; n >= 0; n--)
+			if (s->ps_lifted & BIT(2 * i + n))
+				sleep_ps_lower(s, soc->ps_lift[i].up[n]);
+	}
+	s->ps_lifted = 0;
 	for (i = soc->ps_macos_on.count - 1; i >= 0; i--) {
 		u32 val = s->ps_on_saved[i];
 
@@ -5951,6 +5991,28 @@ static int apple_sleep_begin(suspend_state_t state)
 		ret = apple_sleep->soc->ops->begin(apple_sleep);
 		if (ret)
 			return ret;
+	}
+	/*
+	 * apple_sleep.dispext: the external DCPs' DART PS write-disable bits, before any device
+	 * suspends. Their driver lowers its own domains in its suspend (the firmware-27.2 stop),
+	 * and with a bit set the PMGR drops those writes. J815 reads both set; macOS's are clear
+	 * outside its own brief power-down.
+	 */
+	if (apple_sleep->soc->dispext_optional && READ_ONCE(sleep_dispext)) {
+		const struct apple_sleep_soc *soc = apple_sleep->soc;
+		int i;
+
+		for (i = 1; i < soc->ndisp; i++) {
+			void __iomem *wr;
+			u32 bit;
+
+			if (!soc->disp_wr_dis[i][0])
+				continue;
+			wr = apple_sleep->ps + soc->disp_wr_dis[i][0];
+			bit = BIT(soc->disp_wr_dis[i][1]);
+			if (readl(wr) & bit)
+				writel(readl(wr) & ~bit, wr);
+		}
 	}
 	if (apple_sleep) {
 		apple_sleep->apcie_port_stopped = false;
@@ -7911,9 +7973,13 @@ static void t8142_lower_io(struct apple_sleep *s)
 static bool sleep_pmu_alarm = true;
 module_param_named(pmu_alarm, sleep_pmu_alarm, bool, 0644);
 MODULE_PARM_DESC(pmu_alarm, "T8142: send the PMU's RTC alarm after the S2R timer, as macOS does (default Y)");
-static unsigned int t8142_wake_s = 30;
+/*
+ * A week by default: the step stays as macOS sends it, without a timed wake, so a sleep lasts
+ * until a key, the lid or the power button (30 was the test default; the counter is in s).
+ */
+static unsigned int t8142_wake_s = 7 * 24 * 3600;
 module_param(t8142_wake_s, uint, 0644);
-MODULE_PARM_DESC(t8142_wake_s, "T8142: the PMU RTC alarm this many s after the commit (0: keep the PMU's)");
+MODULE_PARM_DESC(t8142_wake_s, "T8142: the PMU RTC alarm this many s after the commit (default a week; 0: keep the PMU's)");
 static u8 t8142_alarm[4];
 static bool t8142_alarm_ok;
 static int t8142_post_ret = -ENODATA;
@@ -8780,9 +8846,26 @@ static const u32 t8142_ps_aon_wake_order[] = {
  * no_ps in the J815 ADT (FPWM1 next to T8142's own no_ps SMC_FPWM0..3). J815 stalled lowering
  * FPWM1 (boot b7f0f04d: PMU note 0x47, phase 5, index 44). The rule for T8142's sleep lists:
  * no word the J815 ADT marks no_ps, unless T8132 writes the same no_ps word (its AON audio ones).
+ *
+ * One exception: the seven ISP words (CLR, BE, STS0, DPRX, FE, CPU_CORE0, CPU at 0x4000..0x4050)
+ * are no_ps, but on Linux they are the isp node's own power domains, which apple-isp's runtime PM
+ * writes off at every camera stop. With no ISP driver bound (apple_isp loads late on the Airs),
+ * fw_devlink's pending sync_state leaves them as the boot did: on. ISP_SYS (0x2f8) below then
+ * goes off under them and DPRX stays on into the commit, which reset at the commit every time
+ * (J815 boots 1a20945e, b0b7cc80; macOS has DPRX off). Children first, before ISP_SYS; only those
+ * on are lowered, and the wake raises them back. The boot leaves DPRX at state 4 (0x244) while
+ * ISP_FE may be off (e1d118f8's dry run, before apple_isp bound), so t8142_ps_lift raises its
+ * parents first.
  */
+/* DPRX, left on (state 4) by the boot with no ISP driver bound: ISP_SYS, then ISP_FE, first. */
+static const struct apple_sleep_ps_lift t8142_ps_lift[] = {
+	{ 0x4020, { 0x2f8, 0x4018 } },
+};
+
 static const u32 t8142_ps_macos_off[] = {
-	0xc010, 0xc008, 0xc000, 0x8020, 0x8018, 0x8010, 0x8008, 0x8000, 0x510, 0x508,
+	0xc010, 0xc008, 0xc000, 0x8020, 0x8018, 0x8010, 0x8008, 0x8000,
+	0x4050, 0x4048, 0x4030, 0x4020, 0x4018, 0x4008, 0x4000,
+	0x510, 0x508,
 	0x500, 0x4f8, 0x4f0, 0x4e8, 0x4e0, 0x4d8, 0x460, 0x458, 0x450, 0x448,
 	0x440, 0x438, 0x430, 0x400, 0x3f8, 0x3f0, 0x3e8, 0x3e0, 0x3d8, 0x3d0,
 	0x3c8, 0x3c0, 0x3a0, 0x368, 0x360, 0x358, 0x350, 0x348, 0x320, 0x310,
@@ -8832,6 +8915,9 @@ static const struct apple_sleep_word t8142_gate_off[] = {
 /* T8142's, from the J815 tree. GFX's word is in its own block, not "ps". */
 static const struct apple_sleep_gate_coproc t8142_gate_coprocs[] = {
 	{ "/soc/dcp@286e00000", true, 0x10000 },
+	/* The external DCPs, stopped by their driver (firmware 27.2 link release; Thomas, J813) */
+	{ "/soc/dcp@506e00000", true, 0x428 },
+	{ "/soc/dcp@3aae00000", true, 0x3b8 },
 	{ "/soc/pmp@380500000", true },
 	{ "/soc/nvme@4c5cc0000" },	{ "/soc/mtp@394600000" },
 	{ "/soc/aop@390c00000" },	{ "/soc/smc@38c600000" },
@@ -8976,6 +9062,8 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ps_all = SLEEP_WORDS(t8142_ps_all),
 	.ps_aon_all = SLEEP_WORDS(t8142_ps_aon_all),
 	.ps_macos_off = SLEEP_WORDS(t8142_ps_macos_off),
+	.ps_lift = t8142_ps_lift,
+	.nps_lift = ARRAY_SIZE(t8142_ps_lift),
 	.ps_aon_macos_off = SLEEP_WORDS(t8142_ps_aon_macos_off),
 	.ps_aon_macos_on = SLEEP_WORDS(t8142_ps_aon_macos_on),
 	.ps_wake_order = SLEEP_WORDS(t8142_ps_wake_order),
