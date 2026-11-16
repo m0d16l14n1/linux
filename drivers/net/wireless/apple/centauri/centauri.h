@@ -47,6 +47,7 @@ struct centauri {
 	struct centauri_wifi *wifi;
 	struct delayed_work boot_work;
 	enum centauri_boot_phase boot_phase;
+	unsigned int fw_tries;
 	bool removing;
 };
 

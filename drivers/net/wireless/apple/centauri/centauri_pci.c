@@ -167,6 +167,15 @@ static void centauri_boot_worker(struct work_struct *work)
 		switch (c->boot_phase) {
 		case CEN_BOOT_ROM:
 			ret = centauri_rom_boot(c);
+			/*
+			 * A start after a sleep (apple_sleep.radio_cold) can come before userspace
+			 * links the image into firmware_class.path: nothing is allocated yet, so wait.
+			 */
+			if (ret == -ENOENT && c->fw_tries++ < 30) {
+				dev_info(&c->pdev->dev, "N1 image not found yet, retrying in 2 s\n");
+				queue_delayed_work(system_long_wq, &c->boot_work, 2 * HZ);
+				goto out;
+			}
 			if (!ret)
 				c->boot_phase = readl(c->bar + 0x8000) == 1 ?
 					CEN_BOOT_IPC : CEN_BOOT_CYCLE;
