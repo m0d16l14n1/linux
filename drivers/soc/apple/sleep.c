@@ -4293,6 +4293,8 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
  *    before this, with no SPMI traffic near the engine.
  */
 static bool sleep_v27_selected_for(struct apple_sleep *s);
+static int t8142_post_ret_peek(void);
+static u8 t8142_alarm_ok_peek(void);
 
 static int apple_sleep_commit(unsigned long unused)
 {
@@ -4342,11 +4344,17 @@ static int apple_sleep_commit(unsigned long unused)
 	/* Optional: a SoC's own traffic after the timer, every line masked, finished before the release */
 	if (s->soc->ops->post_timer)
 		s->soc->ops->post_timer(s);
+	/* TEST: SPMI after the PMU's commands, to see how far a sleep that resets got */
+	sleep_note_at(s, 2, (u8)t8142_post_ret_peek());
+	sleep_note_at(s, 4, t8142_alarm_ok_peek());
+	sleep_note(s, 0x68);
 
 	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
 	spin_table_release_stopped();
+	sleep_note(s, 0x69);
 	if (s->soc->boot_wfi_delay_ms)
 		mdelay(s->soc->boot_wfi_delay_ms);
+	sleep_note(s, 0x6a);
 	sleep_boot_wfi(s);
 }
 
@@ -7035,6 +7043,16 @@ static u8 t8142_alarm[4];
 static bool t8142_alarm_ok;
 static int t8142_post_ret = -ENODATA;
 static u64 t8142_alarm_counter;
+
+static int t8142_post_ret_peek(void)
+{
+	return t8142_post_ret;
+}
+
+static u8 t8142_alarm_ok_peek(void)
+{
+	return t8142_alarm_ok;
+}
 
 static void t8142_pre_commit(struct apple_sleep *s)
 {
