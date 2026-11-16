@@ -452,13 +452,15 @@ MODULE_PARM_DESC(wake_light,
 
 /*
  * A firmware-driven sleep, and the DPMS power cycle that comes with it, on a SoC whose
- * display power words were derived and never run (T8142, notes/t8142-sleep-RE.md). Off by
- * default: such a DCP keeps the plain suspend path, which keeps its firmware running.
+ * display power words were derived and never run (T8142, notes/t8142-sleep-RE.md). On by
+ * default since 2026-11-16: on J815 it has run through every DPMS off/on and a 4 h s2idle
+ * (aurora-silicon/linux#1941) and through every deep-sleep dry run. 0 keeps the plain
+ * suspend path, which keeps the firmware running.
  */
-static bool s2r_untested;
+static bool s2r_untested = true;
 module_param(s2r_untested, bool, 0444);
 MODULE_PARM_DESC(s2r_untested,
-		 "Stop the DCP for a deep sleep and DPMS off on SoCs where that path is untested (default 0)");
+		 "Stop the DCP for a deep sleep and DPMS off on SoCs where that path is untested (default 1)");
 
 /*
  * T6050: a firmware sleep with a display on a USB-C port, and the external display

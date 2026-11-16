@@ -367,13 +367,15 @@ MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
 
 /*
- * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
- * default: the root disk stays up through a sleep the SoC refuses.
+ * Stop ANS for a deep sleep on a controller whose sleep path was never run to a wake (T8142).
+ * On by default since 2026-11-16: on J815 the stop and the restart after a refused sleep have
+ * passed every deep-sleep dry run, and a deep sleep is refused without it. Only a firmware
+ * (deep) suspend uses it; s2idle doesn't. 0 keeps ANS running and refuses deep sleep.
  */
-static bool sleep_untested;
+static bool sleep_untested = true;
 module_param(sleep_untested, bool, 0444);
 MODULE_PARM_DESC(sleep_untested,
-		 "Stop ANS for a deep sleep where that path is untested (default 0)");
+		 "Stop ANS for a deep sleep where that path is untested (default 1)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
