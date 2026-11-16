@@ -16,6 +16,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 
 #define NCO_CHANNEL_STRIDE	0x4000
 #define NCO_CHANNEL_REGSIZE	20
@@ -70,6 +71,13 @@ struct applnco_channel {
 	struct clk_hw hw;
 
 	spinlock_t lock;
+	/* REG_CTRL, REG_DIV, REG_INC1, REG_INC2 across a sleep that cuts the power */
+	u32 saved[4];
+};
+
+struct applnco_data {
+	unsigned int nchannels;
+	struct applnco_channel *chans[];
 };
 
 #define to_applnco_channel(_hw) container_of(_hw, struct applnco_channel, hw)
@@ -263,6 +271,7 @@ static int applnco_probe(struct platform_device *pdev)
 	void __iomem *base;
 	struct resource *res;
 	struct applnco_tables *tbl;
+	struct applnco_data *data;
 	unsigned int nchannels;
 	int ret, i;
 
@@ -280,6 +289,12 @@ static int applnco_probe(struct platform_device *pdev)
 	if (!onecell_data)
 		return -ENOMEM;
 	onecell_data->num = nchannels;
+
+	data = devm_kzalloc(&pdev->dev, struct_size(data, chans, nchannels), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	data->nchannels = nchannels;
+	platform_set_drvdata(pdev, data);
 
 	tbl = devm_kzalloc(&pdev->dev, sizeof(*tbl), GFP_KERNEL);
 	if (!tbl)
@@ -313,11 +328,63 @@ static int applnco_probe(struct platform_device *pdev)
 			return ret;
 
 		onecell_data->hws[i] = &chan->hw;
+		data->chans[i] = chan;
 	}
 
 	return devm_of_clk_add_hw_provider(&pdev->dev, of_clk_hw_onecell_get,
 							onecell_data);
 }
+
+/*
+ * A sleep that powers the SoC down (suspend-to-RAM through the platform's firmware path)
+ * takes the channels' registers: the audio clusters would come back with no clock. Each
+ * channel's divider, increments and enable go back as they were, the divider first and the
+ * enable last, as set_rate does. A sleep that kept the power writes the same values again.
+ */
+static int applnco_suspend_late(struct device *dev)
+{
+	struct applnco_data *data = dev_get_drvdata(dev);
+	unsigned int i;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+	for (i = 0; i < data->nchannels; i++) {
+		struct applnco_channel *chan = data->chans[i];
+
+		chan->saved[0] = readl_relaxed(chan->base + REG_CTRL);
+		chan->saved[1] = readl_relaxed(chan->base + REG_DIV);
+		chan->saved[2] = readl_relaxed(chan->base + REG_INC1);
+		chan->saved[3] = readl_relaxed(chan->base + REG_INC2);
+	}
+	return 0;
+}
+
+static int applnco_resume_early(struct device *dev)
+{
+	struct applnco_data *data = dev_get_drvdata(dev);
+	unsigned int i;
+
+	if (!pm_resume_via_firmware())
+		return 0;
+	for (i = 0; i < data->nchannels; i++) {
+		struct applnco_channel *chan = data->chans[i];
+		unsigned long flags;
+
+		spin_lock_irqsave(&chan->lock, flags);
+		writel_relaxed(chan->saved[0] & ~CTRL_ENABLE, chan->base + REG_CTRL);
+		writel_relaxed(chan->saved[1], chan->base + REG_DIV);
+		writel_relaxed(chan->saved[2], chan->base + REG_INC1);
+		writel_relaxed(chan->saved[3], chan->base + REG_INC2);
+		writel_relaxed(1 << 31, chan->base + REG_ACCINIT);
+		writel_relaxed(chan->saved[0], chan->base + REG_CTRL);
+		spin_unlock_irqrestore(&chan->lock, flags);
+	}
+	return 0;
+}
+
+static const struct dev_pm_ops applnco_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(applnco_suspend_late, applnco_resume_early)
+};
 
 static const struct of_device_id applnco_ids[] = {
 	{ .compatible = "apple,t8103-nco" },
@@ -330,6 +397,7 @@ static struct platform_driver applnco_driver = {
 	.driver = {
 		.name = "apple-nco",
 		.of_match_table = applnco_ids,
+		.pm = pm_sleep_ptr(&applnco_pm_ops),
 	},
 	.probe = applnco_probe,
 };
