@@ -2099,11 +2099,23 @@ static void sleep_cpu_start_words(struct apple_sleep *s, u32 *w)
 	w[3] = readl(s->cpu_start + CPU_START_CLUSTER(1));
 }
 
+/*
+ * apple_sleep.cpu_start_or: a core start ORs its bits into the SYS and cluster words, as aura's
+ * start (smp.c) and macOS's setCoreOnline/wakeCore do, so the cores already released keep
+ * theirs. A plain write clears them: after a J815 wake only the first core started in each
+ * complex came up (CPU1, CPU7), every later one timed out. N = the old plain write.
+ */
+static bool sleep_cpu_start_or = true;
+module_param_named(cpu_start_or, sleep_cpu_start_or, bool, 0644);
+MODULE_PARM_DESC(cpu_start_or, "Core start ORs into the cpu-start words, keeping running cores' bits (default Y)");
+
 static int sleep_cpu_on(u64 mpidr)
 {
 	struct apple_sleep *s = apple_sleep;
 	unsigned int cluster = sleep_cpu_cluster(s, mpidr), core = sleep_cpu_core(mpidr);
-	bool trace = READ_ONCE(sleep_cpu_on_trace) && s->soc->cpu_clusters >= 2;
+	/* Any SoC with a two-cluster start layout (T8142 states the stride, not cpu_clusters) */
+	bool trace = READ_ONCE(sleep_cpu_on_trace) &&
+		     (s->soc->cpu_clusters >= 2 || s->soc->cpu_start_stride);
 	int cpu = get_logical_index(mpidr & MPIDR_HWID_BITMASK);
 	void __iomem *slot = trace ? sleep_cpu_slot_map(cpu) : NULL;
 	u32 before[4], after[4], ps = 0, gate = 0, edprsr = ~0U;
@@ -2116,8 +2128,16 @@ static int sleep_cpu_on(u64 mpidr)
 			flag0 = sleep_cpu_slot_read(slot, 8);
 	}
 
-	writel(sleep_cpu_start_bit(s, mpidr), s->cpu_start + CPU_START_SYS);
-	writel(BIT(core), s->cpu_start + CPU_START_CLUSTER(cluster));
+	if (READ_ONCE(sleep_cpu_start_or)) {
+		writel(readl(s->cpu_start + CPU_START_SYS) | sleep_cpu_start_bit(s, mpidr),
+		       s->cpu_start + CPU_START_SYS);
+		writel(readl(s->cpu_start + CPU_START_CLUSTER(cluster)) | BIT(core),
+		       s->cpu_start + CPU_START_CLUSTER(cluster));
+	} else {
+		writel(sleep_cpu_start_bit(s, mpidr), s->cpu_start + CPU_START_SYS);
+		writel(BIT(core), s->cpu_start + CPU_START_CLUSTER(cluster));
+	}
+	dsb(sy);
 
 	if (!trace)
 		return 0;
