@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Apple N1 Beta command/event transport for J813 bring-up.
+/* Apple N1 Beta HCI transport driver.
  *
- * The Centauri Control driver must have booted the shared firmware first.
- * This driver owns only Beta. It never resets the port or the Wi-Fi function.
- * BR/EDR discovery, ACL/SDP, pairing and encrypted AVDTP discovery are qualified.
- * ACL remains opt-in; LE data, persistent bonds and audio are unqualified.
- * SCO/ISO delivery is not implemented.
+ * The Centauri Control driver boots the shared firmware first. This driver
+ * owns only the Beta (Bluetooth) PCI function and its ACIPC rings.
  */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -47,15 +45,19 @@
 
 static bool arm_le_data_rings = true;
 module_param(arm_le_data_rings, bool, 0444);
-MODULE_PARM_DESC(arm_le_data_rings, "Arm native Beta LE rings for radio bring-up");
+MODULE_PARM_DESC(arm_le_data_rings, "Arm Beta LE data rings");
 
-static bool arm_auxiliary_rings;
+static bool arm_auxiliary_rings = true;
 module_param(arm_auxiliary_rings, bool, 0444);
-MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta resources and capture received frames privately");
+MODULE_PARM_DESC(arm_auxiliary_rings, "Arm Beta ACL auxiliary rings");
+
+static bool diagnostic_capture;
+module_param(diagnostic_capture, bool, 0444);
+MODULE_PARM_DESC(diagnostic_capture, "Diagnostic: open all auxiliary rings and allocate a 1 MiB debugfs capture buffer");
 
 static bool native_startup;
 module_param(native_startup, bool, 0444);
-MODULE_PARM_DESC(native_startup, "Diagnostic: program a temporary address, InitDone and random seed before the first HCI reset");
+MODULE_PARM_DESC(native_startup, "Diagnostic: program a temporary locally administered address when no factory BD_ADDR is present");
 
 static bool factory_address = true;
 module_param(factory_address, bool, 0444);
@@ -65,24 +67,25 @@ static bool fixup_adv_phy = true;
 module_param(fixup_adv_phy, bool, 0444);
 MODULE_PARM_DESC(fixup_adv_phy, "Mask the firmware's extra bits in LE extended advertising report PHYs");
 
-static bool scan_dup_filter;
+static bool scan_dup_filter = true;
 module_param(scan_dup_filter, bool, 0444);
-MODULE_PARM_DESC(scan_dup_filter, "Let the controller drop duplicate LE advertising reports (off: every report reaches the host)");
+MODULE_PARM_DESC(scan_dup_filter, "Allow controller LE duplicate filtering (uses vendor duplicate-filter reset on scan enable)");
 
 static bool accept_list;
 module_param(accept_list, bool, 0444);
 MODULE_PARM_DESC(accept_list, "Let the controller filter LE scans by its accept list (off: report its size as 0, the host filters)");
 
-static bool enable_acl;
+static bool enable_acl = true;
 module_param(enable_acl, bool, 0444);
-MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE and auxiliary rings");
+MODULE_PARM_DESC(enable_acl, "Enable BR/EDR and LE ACL, SCO, and LE Audio ISO data delivery; requires LE and auxiliary rings");
 
-static bool native_hrb;
+static bool native_hrb = true;
 module_param(native_hrb, bool, 0444);
-MODULE_PARM_DESC(native_hrb, "Experimental native Proxima Create Connection; requires native startup, ACL and firmware capability bit 9");
+MODULE_PARM_DESC(native_hrb, "Translate BR/EDR Create Connection to the firmware's extended connection command when advertised");
 
 #define CEN_OP_READ_PROP_FEATURES 0xffa3
 #define CEN_OP_HRB_CREATE_CONN 0xff7b
+#define CEN_OP_FLUSH_DUPLICATES 0xff3f
 #define CEN_PROP_HRB_CREATE BIT(9)
 
 struct cen_aux_spec {
@@ -90,9 +93,6 @@ struct cen_aux_spec {
 	bool receive;
 };
 
-/* Host native Beta inventory; each resource is opt-in until target-qualified.
- * HCI and LE rings remain in their existing, separately qualified arenas.
- */
 static const struct cen_aux_spec cen_aux_specs[] = {
 	{ 2, 9, 2592, false }, /* ACL TX */
 	{ 3, 9, 724, false },  /* SCO TX */
@@ -110,6 +110,7 @@ static const struct cen_aux_spec cen_aux_specs[] = {
 struct cen_aux_state {
 	u32 offset, packets;
 	u16 head, post;
+	bool opened;
 };
 
 struct cen_bt {
@@ -122,8 +123,8 @@ struct cen_bt {
 	struct mutex lock;
 	struct delayed_work poll;
 	struct sk_buff_head txq;
-	struct sk_buff_head acl_txq, le_txq;
-	u16 acl_tx_head, le_tx_head;
+	struct sk_buff_head acl_txq, le_txq, sco_txq, iso_txq;
+	u16 acl_tx_head, le_tx_head, sco_tx_head, iso_tx_head;
 	u16 message_head, message_tag, tx_head, rx_head, rx_post;
 	u16 le_rx_head, le_rx_post;
 	u32 le_rx_packets;
@@ -137,6 +138,7 @@ struct cen_bt {
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
 	u32 scan_dup_rewritten, accept_list_hidden;
+	bool dup_filter_fallback;
 	bool transport_paused, transport_sleep_sent;
 	/* MSI backed by a DMA buffer, outside the PCI core's IRQ allocation. */
 	struct {
@@ -257,40 +259,142 @@ static void cen_capture_frame(struct cen_bt *bt, u16 ring, const u8 *data, u16 l
 	bt->capture_used += 8 + length;
 }
 
-static int cen_receive_acl(struct cen_bt *bt, const u8 *data, u32 length)
+static void cen_skip_rx_attrs(struct cen_bt *bt, const char *kind,
+			      const u8 *data, u32 offset, u32 length)
 {
-	struct sk_buff *skb;
-	u32 packet_length, pos;
+	u32 pos;
 
-	if (length < HCI_ACL_HDR_SIZE)
-		return -EPROTO;
-	packet_length = HCI_ACL_HDR_SIZE + get_unaligned_le16(data + 2);
-	if (packet_length > length)
-		return -EPROTO;
-	/* Airship RX attributes follow, rather than belong to, the HCI packet.
-	 * Only the native parser's known record sizes are accepted. Their values
-	 * remain opaque and are retained only in the private diagnostic capture.
-	 */
-	for (pos = packet_length; pos < length;) {
+	/* Trailing RX metadata attributes follow the HCI data payload. */
+	for (pos = offset; pos < length;) {
 		if (!data[pos])
 			break;
-		if (data[pos] == 1)
+		if (data[pos] == 1) {
 			pos++;
-		else if (data[pos] == 2 && length - pos >= 9)
+		} else if (data[pos] == 2 && length - pos >= 9) {
 			pos += 9;
-		else
-			return -EPROTO;
+		} else {
+			dev_warn_once(&bt->pdev->dev,
+				      "Ignoring unknown %s RX trailing attribute %#x (remaining=%u)\n",
+				      kind, data[pos], length - pos);
+			break;
+		}
 	}
+}
+
+static void cen_receive_acl(struct cen_bt *bt, const u8 *data, u32 length)
+{
+	struct sk_buff *skb;
+	u32 packet_length;
+
+	if (length < HCI_ACL_HDR_SIZE) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping truncated ACL frame (len=%u)\n",
+				     length);
+		return;
+	}
+	packet_length = HCI_ACL_HDR_SIZE + get_unaligned_le16(data + 2);
+	if (packet_length > length) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping malformed ACL frame (hdr_len=%u ring_len=%u)\n",
+				     packet_length, length);
+		return;
+	}
+	cen_skip_rx_attrs(bt, "ACL", data, packet_length, length);
 	skb = bt_skb_alloc(packet_length, GFP_KERNEL);
 	if (!skb) {
 		bt->hdev->stat.err_rx++;
-		return 0;
+		return;
 	}
 	skb_put_data(skb, data, packet_length);
 	hci_skb_pkt_type(skb) = HCI_ACLDATA_PKT;
 	bt->hdev->stat.byte_rx += packet_length;
 	hci_recv_frame(bt->hdev, skb);
-	return 0;
+}
+
+static void cen_receive_sco(struct cen_bt *bt, const u8 *data, u32 length)
+{
+	struct sk_buff *skb;
+	u32 packet_length;
+
+	if (length < HCI_SCO_HDR_SIZE) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping truncated SCO frame (len=%u)\n",
+				     length);
+		return;
+	}
+	packet_length = HCI_SCO_HDR_SIZE + data[2];
+	if (packet_length > length) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping malformed SCO frame (hdr_len=%u ring_len=%u)\n",
+				     packet_length, length);
+		return;
+	}
+	cen_skip_rx_attrs(bt, "SCO", data, packet_length, length);
+	skb = bt_skb_alloc(packet_length, GFP_KERNEL);
+	if (!skb) {
+		bt->hdev->stat.err_rx++;
+		return;
+	}
+	skb_put_data(skb, data, packet_length);
+	hci_skb_pkt_type(skb) = HCI_SCODATA_PKT;
+	bt->hdev->stat.byte_rx += packet_length;
+	hci_recv_frame(bt->hdev, skb);
+}
+
+static void cen_receive_iso(struct cen_bt *bt, const u8 *data, u32 length)
+{
+	struct sk_buff *skb;
+	u32 packet_length;
+
+	/* Ring 11 prefixes each payload with an H4 packet indicator byte. */
+	if (length < 1) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping empty ISO ring frame\n");
+		return;
+	}
+	if (data[0] == HCI_ACLDATA_PKT) {
+		cen_receive_acl(bt, data + 1, length - 1);
+		return;
+	}
+	if (data[0] != HCI_ISODATA_PKT) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping unexpected ISO ring packet type %#x (len=%u)\n",
+				     data[0], length);
+		return;
+	}
+	data++;
+	length--;
+	if (length < HCI_ISO_HDR_SIZE) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping truncated ISO frame (len=%u)\n",
+				     length);
+		return;
+	}
+	packet_length = HCI_ISO_HDR_SIZE + (get_unaligned_le16(data + 2) & 0x3fff);
+	if (packet_length > length) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping malformed ISO frame (hdr_len=%u ring_len=%u)\n",
+				     packet_length, length);
+		return;
+	}
+	cen_skip_rx_attrs(bt, "ISO", data, packet_length, length);
+	skb = bt_skb_alloc(packet_length, GFP_KERNEL);
+	if (!skb) {
+		bt->hdev->stat.err_rx++;
+		return;
+	}
+	skb_put_data(skb, data, packet_length);
+	hci_skb_pkt_type(skb) = HCI_ISODATA_PKT;
+	bt->hdev->stat.byte_rx += packet_length;
+	hci_recv_frame(bt->hdev, skb);
 }
 
 static void cen_aux_rx_buffer(struct cen_bt *bt, unsigned int index, u16 slot)
@@ -301,6 +405,11 @@ static void cen_aux_rx_buffer(struct cen_bt *bt, unsigned int index, u16 slot)
 	memset(descriptor, 0, 16 + spec->footer);
 	put_unaligned_le32(1 | (spec->footer << 8), descriptor);
 	put_unaligned_le16(slot + 1, descriptor + 12);
+}
+
+static bool cen_aux_required(u16 id)
+{
+	return id == 2 || id == 3 || id == 5 || id == 8 || id == 9 || id == 11;
 }
 
 static int cen_aux_start(struct cen_bt *bt)
@@ -318,11 +427,14 @@ static int cen_aux_start(struct cen_bt *bt)
 			return -ENOSPC;
 		state->offset = offset;
 		offset = ALIGN(offset + length, SZ_4K);
+		if (!diagnostic_capture && !cen_aux_required(spec->id))
+			continue;
 		ret = cen_open_ring(bt, spec->id, spec->slots, state->offset, spec->footer);
 		if (ret) {
 			dev_err(&bt->pdev->dev, "Auxiliary ring %u open failed: %d\n", spec->id, ret);
 			return ret;
 		}
+		state->opened = true;
 		if (!spec->receive)
 			continue;
 		for (slot = 0; slot < spec->slots - 1; slot++)
@@ -343,7 +455,7 @@ static int cen_aux_drain(struct cen_bt *bt, bool repost)
 		u16 tail;
 		int budget = spec->slots;
 
-		if (!spec->receive)
+		if (!state->opened || !spec->receive)
 			continue;
 		tail = cen_tail(bt, spec->id);
 		if (tail >= spec->slots)
@@ -357,9 +469,14 @@ static int cen_aux_drain(struct cen_bt *bt, bool repost)
 			if (length > spec->footer)
 				return -EPROTO;
 			cen_capture_frame(bt, spec->id, descriptor + 16, length);
-			if (repost && enable_acl && spec->id == 8 &&
-			    cen_receive_acl(bt, descriptor + 16, length))
-				return -EPROTO;
+			if (repost && enable_acl) {
+				if (spec->id == 8)
+					cen_receive_acl(bt, descriptor + 16, length);
+				else if (spec->id == 9)
+					cen_receive_sco(bt, descriptor + 16, length);
+				else if (spec->id == 11)
+					cen_receive_iso(bt, descriptor + 16, length);
+			}
 			state->packets++;
 			state->head = (state->head + 1) % spec->slots;
 			if (repost) {
@@ -390,7 +507,7 @@ static int cen_start(struct cen_bt *bt)
 	put_unaligned_le64(bt->dma + CEN_MTR, bt->arena + 0x3c);
 	put_unaligned_le16(16, bt->arena + 0x44);
 	put_unaligned_le16(16, bt->arena + 0x46);
-	/* The 25G76 native context encodes the MCR footer in four-byte words. */
+	/* MCR footer length is encoded in 4-byte words. */
 	bt->arena[0x53] = 4;
 	put_unaligned_le64(bt->dma + 0x10000, bt->arena + 0x58);
 	pci_set_master(bt->pdev);
@@ -457,16 +574,23 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 		descriptor = bt->arena + offset + *head * (16 + footer);
 		memset(descriptor, 0, 16 + footer);
 		put_unaligned_le16(*head + 1, descriptor + 12);
-		memcpy(descriptor + 16, skb->data, skb->len);
-		wire_length = skb->len;
+		if (ring == 5) {
+			descriptor[16] = HCI_ISODATA_PKT;
+			memcpy(descriptor + 17, skb->data, skb->len);
+			wire_length = skb->len + 1;
+		} else {
+			memcpy(descriptor + 16, skb->data, skb->len);
+			wire_length = skb->len;
+		}
+		if (ring == 1 && get_unaligned_le16(skb->data) == HCI_OP_RESET)
+			bt->hrb_status_pending = false;
 		if (ring == 1 && READ_ONCE(bt->hrb_supported) &&
 		    get_unaligned_le16(skb->data) == HCI_OP_CREATE_CONN) {
 			u8 *command = descriptor + 16;
 
-			/* Native Proxima uses the ordinary 13-byte parameter layout
-			 * followed by two zero HRB fields (no forced band). It sends
-			 * tagging=false and role_switch=0. Address byte order matches
-			 * standard HCI. Keep the core's sent skb/opcode unchanged.
+			/* Extended Create Connection extends the 13-byte HCI
+			 * parameter payload with two zero bytes while leaving
+			 * the core's skb opcode unchanged.
 			 */
 			put_unaligned_le16(CEN_OP_HRB_CREATE_CONN, command);
 			command[2] = 15;
@@ -482,8 +606,10 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 		cen_post(bt, ring, next);
 		if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT)
 			bt->hdev->stat.cmd_tx++;
-		else
+		else if (hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT)
 			bt->hdev->stat.acl_tx++;
+		else if (hci_skb_pkt_type(skb) == HCI_SCODATA_PKT)
+			bt->hdev->stat.sco_tx++;
 		bt->hdev->stat.byte_tx += wire_length;
 		kfree_skb(skb);
 	}
@@ -547,7 +673,7 @@ static void cen_poll(struct work_struct *work)
 	int budget = CEN_RX_SLOTS;
 
 	mutex_lock(&bt->lock);
-	if (!bt->running || bt->transport_paused)
+	if (!bt->running || READ_ONCE(bt->transport_paused))
 		goto unlock;
 	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 2) {
 		/* Preserve already completed diagnostics after abort, without posting
@@ -571,8 +697,8 @@ static void cen_poll(struct work_struct *work)
 				goto protocol_error;
 			bt->le_rx_packets++;
 			cen_capture_frame(bt, 10, descriptor + 16, length);
-			if (enable_acl && cen_receive_acl(bt, descriptor + 16, length))
-				goto protocol_error;
+			if (enable_acl)
+				cen_receive_acl(bt, descriptor + 16, length);
 			bt->le_rx_head = (bt->le_rx_head + 1) % CEN_LE_SLOTS;
 			cen_le_rx_buffer(bt, bt->le_rx_post);
 			bt->le_rx_post = (bt->le_rx_post + 1) % CEN_LE_SLOTS;
@@ -594,8 +720,8 @@ static void cen_poll(struct work_struct *work)
 		if (skb) {
 			skb_put_data(skb, descriptor + 16, length);
 			/* The firmware's status belongs to the standard connection
-			 * request tracked by Linux. Capture the native response before
-			 * restoring only its opcode; preserve status and command credit.
+			 * request tracked by Linux. Restore only its opcode while
+			 * preserving status and command credit.
 			 */
 			if (bt->hrb_status_pending && length == 6 &&
 			    skb->data[0] == HCI_EV_CMD_STATUS &&
@@ -605,10 +731,8 @@ static void cen_poll(struct work_struct *work)
 				bt->hrb_status_pending = false;
 				bt->hrb_status_events++;
 			}
-			/* Native HCI flow treats 0xf0/0xf1 Connection Complete as
-			 * ACL, with additional proprietary capability flags. Linux
-			 * otherwise cannot find its pending ACL connection by type.
-			 * Preserve the original event privately before normalizing it.
+			/* Normalize vendor 0xf0/0xf1 Connection Complete link types
+			 * to standard ACL_LINK so HCI matches the pending connection.
 			 */
 			if (READ_ONCE(bt->hrb_supported) &&
 			    length == HCI_EVENT_HDR_SIZE + sizeof(struct hci_ev_conn_complete) &&
@@ -635,20 +759,34 @@ static void cen_poll(struct work_struct *work)
 	if (cen_transmit(bt, &bt->txq, 1, CEN_TX_SLOTS, CEN_TX,
 			 CEN_FOOTER, &bt->tx_head))
 		goto protocol_error;
-	/* cen_aux_specs[0] is the native BR/EDR ACL TX resource (ring 2). */
+	/* cen_aux_specs[0/1/2] are BR/EDR ACL (2), SCO (3), and ISO (5) TX rings. */
 	if (enable_acl &&
-	    (cen_transmit(bt, &bt->acl_txq, 2, cen_aux_specs[0].slots,
-			  bt->aux[0].offset, cen_aux_specs[0].footer,
-			  &bt->acl_tx_head) ||
+	    ((bt->aux[0].opened &&
+	      cen_transmit(bt, &bt->acl_txq, 2, cen_aux_specs[0].slots,
+			   bt->aux[0].offset, cen_aux_specs[0].footer,
+			   &bt->acl_tx_head)) ||
 	     cen_transmit(bt, &bt->le_txq, 4, CEN_LE_SLOTS, CEN_LE_TX,
-			  CEN_LE_FOOTER, &bt->le_tx_head)))
+			  CEN_LE_FOOTER, &bt->le_tx_head) ||
+	     (bt->aux[1].opened &&
+	      cen_transmit(bt, &bt->sco_txq, 3, cen_aux_specs[1].slots,
+			   bt->aux[1].offset, cen_aux_specs[1].footer,
+			   &bt->sco_tx_head)) ||
+	     (bt->aux[2].opened &&
+	      cen_transmit(bt, &bt->iso_txq, 5, cen_aux_specs[2].slots,
+			   bt->aux[2].offset, cen_aux_specs[2].footer,
+			   &bt->iso_tx_head))))
 		goto protocol_error;
-	schedule_delayed_work(&bt->poll, msecs_to_jiffies(1));
+	/*
+	 * Beta's MSI is a DMA-backed mailbox the firmware programs itself, not a
+	 * vector the PCI core hands out (see cen_resume_noirq()), so the rings
+	 * are polled.
+	 */
+	mod_delayed_work(system_percpu_wq, &bt->poll, msecs_to_jiffies(1));
 	goto unlock;
 protocol_error:
 	bt->running = false;
 	hdev->stat.err_rx++;
-	dev_err(&bt->pdev->dev, "Beta transport stopped (exec=%u ipc=%u); polling disabled\n",
+	dev_err(&bt->pdev->dev, "Beta transport stopped (exec=%u ipc=%u)\n",
 		readl(bt->bar + 0x18), readl(bt->bar));
 unlock:
 	mutex_unlock(&bt->lock);
@@ -660,7 +798,8 @@ static int cen_hci_open(struct hci_dev *hdev)
 
 	mutex_lock(&bt->lock);
 	bt->running = true;
-	schedule_delayed_work(&bt->poll, 0);
+	if (!READ_ONCE(bt->transport_paused))
+		mod_delayed_work(system_percpu_wq, &bt->poll, 0);
 	mutex_unlock(&bt->lock);
 	return 0;
 }
@@ -677,7 +816,35 @@ static int cen_hci_close(struct hci_dev *hdev)
 	skb_queue_purge(&bt->txq);
 	skb_queue_purge(&bt->acl_txq);
 	skb_queue_purge(&bt->le_txq);
+	skb_queue_purge(&bt->sco_txq);
+	skb_queue_purge(&bt->iso_txq);
 	return 0;
+}
+
+static void cen_hci_reset(struct hci_dev *hdev)
+{
+	struct cen_bt *bt = hci_get_drvdata(hdev);
+	bool paused;
+	u32 exec, ipc;
+
+	mutex_lock(&bt->lock);
+	bt->hrb_status_pending = false;
+	paused = READ_ONCE(bt->transport_paused);
+	if (!paused && bt->bar && bt->arena) {
+		exec = readl(bt->bar + 0x18);
+		ipc = readl(bt->bar);
+		bt_dev_err(hdev,
+			   "HCI command timeout (exec=%u ipc=%u running=%u tx=%u/%u rx=%u/%u)",
+			   exec, ipc, bt->running, bt->tx_head, cen_tail(bt, 1),
+			   bt->rx_head, cen_tail(bt, 7));
+	} else {
+		bt_dev_err(hdev,
+			   "HCI command timeout while transport unavailable (running=%u paused=%u)",
+			   bt->running, paused);
+	}
+	if (bt->running && !paused)
+		mod_delayed_work(system_percpu_wq, &bt->poll, 0);
+	mutex_unlock(&bt->lock);
 }
 
 static int cen_vendor_command(struct hci_dev *hdev, u16 opcode,
@@ -692,6 +859,25 @@ static int cen_vendor_command(struct hci_dev *hdev, u16 opcode,
 	ret = skb->len < 1 ? -EPROTO : -bt_to_errno(skb->data[0]);
 	kfree_skb(skb);
 	return ret;
+}
+
+static int cen_hci_reset_dup_filter(struct hci_dev *hdev)
+{
+	struct cen_bt *bt = hci_get_drvdata(hdev);
+	static const u8 flags;
+	int ret;
+
+	if (READ_ONCE(bt->dup_filter_fallback))
+		return 0;
+	ret = __hci_cmd_sync_status(hdev, CEN_OP_FLUSH_DUPLICATES,
+				    sizeof(flags), &flags, HCI_CMD_TIMEOUT);
+	if (ret) {
+		bt_dev_warn(hdev,
+			    "Duplicate filter reset failed (%d); falling back to host filtering",
+			    ret);
+		WRITE_ONCE(bt->dup_filter_fallback, true);
+	}
+	return 0;
 }
 
 static int cen_hci_post_init(struct hci_dev *hdev)
@@ -712,12 +898,15 @@ static int cen_hci_post_init(struct hci_dev *hdev)
 	features = skb->len == 5 ? get_unaligned_le32(skb->data + 1) : 0;
 	kfree_skb(skb);
 	WRITE_ONCE(bt->proprietary_features, features);
-	if (ret)
-		return ret;
-	if (!(features & CEN_PROP_HRB_CREATE))
-		return -EOPNOTSUPP;
+	if (!ret && !(features & CEN_PROP_HRB_CREATE))
+		ret = -EOPNOTSUPP;
+	if (ret) {
+		bt_dev_warn(hdev, "Firmware connection command unavailable: %d",
+			    ret);
+		return 0;
+	}
 	WRITE_ONCE(bt->hrb_supported, true);
-	bt_dev_info(hdev, "Native Proxima Create Connection capability confirmed");
+	bt_dev_dbg(hdev, "Extended Create Connection capability confirmed");
 	return 0;
 }
 
@@ -743,6 +932,18 @@ static int cen_bt_address(struct device *dev, u8 address[6])
 	return 0;
 }
 
+static int cen_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
+{
+	u8 address[6];
+	int i;
+
+	for (i = 0; i < 6; i++)
+		address[i] = bdaddr->b[5 - i];
+	if (is_zero_ether_addr(address) || is_broadcast_ether_addr(address))
+		return -EINVAL;
+	return cen_vendor_command(hdev, 0xfc06, address, sizeof(address));
+}
+
 static int cen_hci_setup(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
@@ -760,11 +961,8 @@ static int cen_hci_setup(struct hci_dev *hdev)
 	if (!factory && !native_startup)
 		return 0;
 
-	/* Native PROXIMA initialization starts with these three commands, then
-	 * HCI Reset. The core calls setup before its ordinary reset/init sequence.
-	 * The address is the factory one when the loader provided it, else
-	 * (diagnostic) a temporary locally administered address, in native
-	 * WriteBdAddr display/network byte order.
+	/* Controller initialization runs WriteBdAddr, InitDone, and RNG seed
+	 * before the core's standard HCI Reset sequence.
 	 */
 	if (!factory) {
 		ret = get_random_bytes_wait(address, sizeof(address));
@@ -803,6 +1001,8 @@ static int cen_hci_flush(struct hci_dev *hdev)
 	skb_queue_purge(&bt->txq);
 	skb_queue_purge(&bt->acl_txq);
 	skb_queue_purge(&bt->le_txq);
+	skb_queue_purge(&bt->sco_txq);
+	skb_queue_purge(&bt->iso_txq);
 	return 0;
 }
 
@@ -830,7 +1030,7 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 			queue = &bt->le_txq;
 			if (skb->len > CEN_LE_FOOTER)
 				ret = -EMSGSIZE;
-		} else if (link_type == ACL_LINK) {
+		} else if (link_type == ACL_LINK && bt->aux[0].opened) {
 			queue = &bt->acl_txq;
 			if (skb->len > cen_aux_specs[0].footer)
 				ret = -EMSGSIZE;
@@ -839,6 +1039,25 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		}
 		if (ret)
 			goto out;
+	} else if (hci_skb_pkt_type(skb) == HCI_SCODATA_PKT && enable_acl &&
+		   bt->aux[1].opened) {
+		if (skb->len < HCI_SCO_HDR_SIZE ||
+		    skb->len != HCI_SCO_HDR_SIZE + skb->data[2] ||
+		    skb->len > cen_aux_specs[1].footer) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		queue = &bt->sco_txq;
+	} else if (hci_skb_pkt_type(skb) == HCI_ISODATA_PKT && enable_acl &&
+		   bt->aux[2].opened) {
+		if (skb->len < HCI_ISO_HDR_SIZE ||
+		    skb->len != HCI_ISO_HDR_SIZE +
+				(get_unaligned_le16(skb->data + 2) & 0x3fff) ||
+		    skb->len + 1 > cen_aux_specs[2].footer) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		queue = &bt->iso_txq;
 	} else if (hci_skb_pkt_type(skb) != HCI_COMMAND_PKT) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -871,7 +1090,8 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 	 * scan_dup_filter is set, enable scans with Filter_Duplicates = 0; the
 	 * host copes with repeated reports.
 	 */
-	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT && skb->len >= 5 && !scan_dup_filter &&
+	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT && skb->len >= 5 &&
+	    (!scan_dup_filter || READ_ONCE(bt->dup_filter_fallback)) &&
 	    (get_unaligned_le16(skb->data) == HCI_OP_LE_SET_EXT_SCAN_ENABLE ||
 	     get_unaligned_le16(skb->data) == HCI_OP_LE_SET_SCAN_ENABLE) &&
 	    skb->data[3] && skb->data[4] && !skb_ensure_writable(skb, 5)) {
@@ -884,7 +1104,8 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		ret = -ENOBUFS;
 	else {
 		skb_queue_tail(queue, skb);
-		mod_delayed_work(system_percpu_wq, &bt->poll, 0);
+		if (!READ_ONCE(bt->transport_paused))
+			mod_delayed_work(system_percpu_wq, &bt->poll, 0);
 	}
 	mutex_unlock(&bt->lock);
 	if (!ret)
@@ -898,13 +1119,11 @@ out:
 
 static void cen_stop(struct cen_bt *bt)
 {
+	cancel_delayed_work_sync(&bt->poll);
 	pci_clear_master(bt->pdev);
 	kvfree(bt->capture);
 	bt->capture = NULL;
-	/* IPC control 0 caused a firmware abort in the initial hardware probe.
-	 * Until coordinated firmware teardown is understood, retain any published
-	 * arena after detaching. A fresh firmware boot is required before rebinding.
-	 */
+	/* Retain any published arena after detaching until a fresh firmware boot. */
 	if (bt->ipc_requested || !pci_wait_for_pending_transaction(bt->pdev))
 		dev_warn(&bt->pdev->dev, "Beta detach requires fresh firmware boot; retaining DMA arena\n");
 	else
@@ -946,12 +1165,15 @@ static int cen_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
 		   enable_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
 		   skb_queue_len(&bt->acl_txq), skb_queue_len(&bt->le_txq));
+	seq_printf(s, "sco_tx=%u sco_rx=%u sco_queued=%u iso_queued=%u\n",
+		   bt->hdev->stat.sco_tx, bt->hdev->stat.sco_rx,
+		   skb_queue_len(&bt->sco_txq), skb_queue_len(&bt->iso_txq));
 	seq_printf(s, "auxiliary_rings=%u messages=%u message_head=%u capture_bytes=%u capture_records=%u capture_dropped=%u\n",
 		   arm_auxiliary_rings, bt->message_tag, bt->message_head,
 		   bt->capture_used, bt->capture_records, bt->capture_dropped);
 	if (arm_auxiliary_rings)
 		for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++)
-			if (cen_aux_specs[i].receive)
+			if (bt->aux[i].opened && cen_aux_specs[i].receive)
 				seq_printf(s, "aux_rx ring=%u packets=%u consumed=%u device_tail=%u\n",
 					   cen_aux_specs[i].id, bt->aux[i].packets,
 					   bt->aux[i].head, cen_tail(bt, cen_aux_specs[i].id));
@@ -1026,9 +1248,11 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	skb_queue_head_init(&bt->txq);
 	skb_queue_head_init(&bt->acl_txq);
 	skb_queue_head_init(&bt->le_txq);
+	skb_queue_head_init(&bt->sco_txq);
+	skb_queue_head_init(&bt->iso_txq);
 	if (enable_acl && (!arm_le_data_rings || !arm_auxiliary_rings))
 		return -EINVAL;
-	if (native_hrb && (!native_startup || !enable_acl))
+	if (native_hrb && ((!native_startup && !factory_address) || !enable_acl))
 		return -EINVAL;
 	INIT_DELAYED_WORK(&bt->poll, cen_poll);
 	ret = pcim_enable_device(pdev);
@@ -1056,7 +1280,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!bt->arena)
 		return -ENOMEM;
 	memset(bt->arena, 0, CEN_ARENA_SIZE);
-	if (arm_auxiliary_rings) {
+	if (arm_auxiliary_rings && diagnostic_capture) {
 		bt->capture = kvzalloc(CEN_CAPTURE_SIZE, GFP_KERNEL);
 		if (!bt->capture) {
 			ret = -ENOMEM;
@@ -1080,7 +1304,10 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->flush = cen_hci_flush;
 	hdev->send = cen_hci_send;
 	hdev->setup = cen_hci_setup;
+	hdev->set_bdaddr = cen_hci_set_bdaddr;
 	hdev->post_init = cen_hci_post_init;
+	hdev->reset = cen_hci_reset;
+	hdev->reset_dup_filter = cen_hci_reset_dup_filter;
 	/*
 	 * The N1 sets bits above the PHY value in LE Extended Advertising
 	 * Reports, as on T6050 (btcentauri_t6050.c). Unmasked, no PHY matches in
@@ -1089,6 +1316,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 */
 	if (fixup_adv_phy)
 		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
+	hci_set_quirk(hdev, HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
 	pci_set_drvdata(pdev, bt);
@@ -1103,7 +1331,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		debugfs_create_file("auxiliary_capture", 0400, bt->debug, bt, &cen_capture_fops);
 		debugfs_create_file("capture_reset", 0200, bt->debug, bt, &cen_capture_reset_fops);
 	}
-	dev_info(&pdev->dev, "Beta HCI transport registered; ACL enabled=%u, SCO/ISO unsupported\n",
+	dev_info(&pdev->dev, "Beta HCI transport registered; ACL/SCO/ISO enabled=%u\n",
 		 enable_acl);
 	return 0;
 stop:
@@ -1123,19 +1351,9 @@ static void cen_remove(struct pci_dev *pdev)
 }
 
 /*
- * As for the Wi-Fi functions (centauri_pci.c): the firmware keeps running, so
- * keep the function enabled and in D0 (the PCI core's default suspend turns
- * bus mastering off, and the next poll stopped the transport for good) and
- * the PCIe host powered. Polling pauses across the sleep.
- */
-/*
- * 26B123 AirshipDK: Beta sleep_control is BAR0 + 0x1078. Host sleep
- * writes 3 and waits for peripheral_info.sleep_status == 3; wake writes
- * 0 and waits for status 0 (active) or 1 (device sleep). The peripheral
- * info block is at context + 0x68, with sleep_status at +8.
- *
- * Qualified on J813 with the installed Linux firmware.
- * All ring doorbells must stay paused until the wake acknowledgment.
+ * Beta ACIPC host-sleep uses BAR0 + 0x1078 for sleep_control (3 = sleep,
+ * 0 = wake) and polls peripheral_info.sleep_status at context + 0x70
+ * (3 = asleep, <= 1 = awake). Keep all ring doorbells paused until wake.
  */
 static u32 cen_sleep_status(struct cen_bt *bt)
 {
@@ -1172,10 +1390,11 @@ static int cen_suspend(struct device *dev)
 	int cap, ret;
 
 	mutex_lock(&bt->lock);
-	bt->transport_paused = true;
+	WRITE_ONCE(bt->transport_paused, true);
 	mutex_unlock(&bt->lock);
 	cancel_delayed_work_sync(&bt->poll);
-	if (of_machine_is_compatible("apple,j813") && bt->ipc_requested) {
+	if (bt->ipc_requested && readl(bt->bar + 0x18) == 2 &&
+	    readl(bt->bar) == 2) {
 		bt->transport_sleep_sent = true;
 		ret = cen_transport_state(bt, true);
 		if (ret)
@@ -1240,9 +1459,9 @@ static int cen_resume(struct device *dev)
 		bt->transport_sleep_sent = false;
 	}
 	mutex_lock(&bt->lock);
-	bt->transport_paused = false;
+	WRITE_ONCE(bt->transport_paused, false);
 	if (bt->running)
-		schedule_delayed_work(&bt->poll, 0);
+		mod_delayed_work(system_percpu_wq, &bt->poll, 0);
 	mutex_unlock(&bt->lock);
 	return 0;
 }
@@ -1267,4 +1486,4 @@ static struct pci_driver cen_driver = {
 };
 module_pci_driver(cen_driver);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Apple N1 Beta HCI command/event transport for J813 and J873 bring-up");
+MODULE_DESCRIPTION("Apple N1 Beta HCI Bluetooth transport");
