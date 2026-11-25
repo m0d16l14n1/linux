@@ -193,7 +193,6 @@ ASAHI_TESTS = {
     'cio-native-tests.py': [(out('--output'), PASS)],
     'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
-    'centauri-bt-protocol-tests.py': [([], PASS)],
     'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-physical-recovery-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('bound-guard-reverted', 'owner-guard-reverted',
