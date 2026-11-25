@@ -6,7 +6,6 @@
  * J813 board fragments and overrides what the J815 ADT shows to be
  * different:
  *
- *  - /chosen board-id 0x26 (J813: 0x24)
  *  - 15.3" 2880x1864 panel (2880x1800 below the notch), 326 x 211 mm
  *  - six SN012776 speaker amplifiers on i2c3 (0x38-0x3d: two tweeters and
  *    four force-cancelling woofers); J813 has four
@@ -140,11 +139,6 @@
 		 */
 		apple,palm-tool-area = <1200 2200>;
 	};
-};
-
-&pmp {
-	/* ADT /chosen board-id (J815) */
-	apple,board-id = <38>;
 };
 
 &panel {
