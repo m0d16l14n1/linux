@@ -325,3 +325,5 @@
 		};
 	};
 };
+
+#include "t8142-magsafe.dtsi"
